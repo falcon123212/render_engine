@@ -11,13 +11,36 @@ de NVIDIA). Tout est automatisé : il n'y a aucun réglage à faire dans Blender
 
 | Élément | Exigence |
 |---|---|
-| Système | Windows 10 ou 11 |
+| Système | Windows 10/11 **ou Linux** x86-64 (Ubuntu 22.04+ ou équivalent) |
 | Carte | NVIDIA RTX (testé sur RTX 4060, prévu sur **RTX 5070**) |
-| Pilote | **570 ou plus** (obligatoire pour les RTX 50xx) |
-| Blender | **5.0.1 exactement** : <https://download.blender.org/release/Blender5.0/> (installeur `blender-5.0.1-windows-x64.msi`) |
-| Python | 3.10 ou plus, sans paquet supplémentaire. Si `python` n'est pas reconnu, remplace-le par `py` dans les commandes. |
+| Pilote | **570 ou plus** (obligatoire pour les RTX 50xx) ; sous Linux, le pilote propriétaire NVIDIA |
+| Blender | **5.0.1 exactement** : <https://download.blender.org/release/Blender5.0/>. Windows : `blender-5.0.1-windows-x64.msi` ; Linux : `blender-5.0.1-linux-x64.tar.xz` |
+| Python | 3.10 ou plus, sans paquet supplémentaire. Windows : `python` (ou `py`) ; Linux : `python3` |
 | Git | Pour récupérer le dépôt |
 | Disque | Environ 5 Go libres |
+
+> **Sous Linux**, remplace `python` par `python3` dans toutes les commandes ci-dessous.
+> Les sections « Linux » donnent les rares commandes qui changent.
+
+### Linux uniquement : installer Blender 5.0.1
+
+Pas besoin des droits administrateur. Le script trouve tout seul Blender dans
+`~/blender-5.0.1-linux-x64/` :
+
+```bash
+cd ~ && wget https://download.blender.org/release/Blender5.0/blender-5.0.1-linux-x64.tar.xz
+```
+
+```bash
+tar -xf blender-5.0.1-linux-x64.tar.xz
+```
+
+```bash
+~/blender-5.0.1-linux-x64/blender --version
+```
+
+Si Blender est ailleurs, indique son chemin une fois pour toutes dans la session :
+`export BLENDER=/chemin/vers/blender`.
 
 ## Étape 1 : récupérer le dépôt et les données
 
@@ -29,10 +52,19 @@ git clone -b rendu https://github.com/falcon123212/render_engine.git Render_Engi
 cd Render_Engine
 ```
 
-Nicolas t'envoie **`render_inputs.zip`**. Copie-le dans `Render_Engine`, puis :
+Nicolas t'envoie **`render_inputs.zip`**. Copie-le dans `Render_Engine`, puis décompresse-le
+sur place.
+
+Windows (PowerShell) :
 
 ```powershell
 Expand-Archive render_inputs.zip -DestinationPath .
+```
+
+Linux :
+
+```bash
+unzip render_inputs.zip
 ```
 
 ## Étape 2 : vérifier la machine (1 minute)
@@ -48,8 +80,9 @@ OptiX, les données et les caméras. Il doit finir par **`PRÊT`**.
 - Une ligne `[KO]` indique ce qu'il faut corriger : pilote, version de Blender, archive mal
   décompressée…
 
-Si Blender est installé ailleurs, ajoute `--blender "D:\...\blender.exe"` à **toutes** les
-commandes.
+Si Blender est installé ailleurs, ajoute `--blender "D:\...\blender.exe"` (Windows) ou
+`--blender /chemin/blender` (Linux) à **toutes** les commandes. Tu peux aussi définir la
+variable d'environnement `BLENDER`.
 
 ## Étape 3 : test rapide (2 à 3 minutes)
 
@@ -58,7 +91,7 @@ python bench/render/run_renders.py --quick
 ```
 
 Chaque ligne doit indiquer `OK`. Regarde ensuite les petites images dans
-`data\renders_quick\` :
+`data/renders_quick/` :
 
 - `vlasic_*` : une personne grise, entière dans le cadre ;
 - `cloth_violent` : un drapeau gris aux plis lisses ;
@@ -73,7 +106,7 @@ python bench/render/run_renders.py
 - Ne lance ni jeu ni logiciel lourd sur la carte pendant les rendus.
 - Tu peux interrompre (Ctrl+C) ou éteindre le PC, puis relancer **la même commande** : ce
   qui est déjà rendu n'est pas refait.
-- À la fin, chaque ligne doit indiquer `OK`. Le bilan est dans `data\renders\report.json`.
+- À la fin, chaque ligne doit indiquer `OK`. Le bilan est dans `data/renders/report.json`.
 
 ## Étape 5 : renvoyer les résultats
 
@@ -126,10 +159,25 @@ nouveaux jeux seront rendus.
 Nicolas t'enverra les jeux décodés, avec la même arborescence que `data/`. La commande sera :
 
 ```bash
-python bench/render/run_renders.py --labels decoded --decoded-root chemin\vers\decoded\data
+python bench/render/run_renders.py --labels decoded --decoded-root chemin/vers/decoded/data
 ```
 
 Ensuite, renvoie les résultats de la même façon (étape 5).
+
+## Linux : points d'attention
+
+- **Lancer les rendus en arrière-plan** (par exemple en SSH), pour qu'ils continuent après
+  la déconnexion :
+
+  ```bash
+  nohup python3 bench/render/run_renders.py > rendus.log 2>&1 &
+  ```
+
+  Suis l'avancement avec `tail -f rendus.log`.
+- **Pilote** : `nvidia-smi` doit afficher la carte. Sans le pilote propriétaire NVIDIA
+  (avec nouveau), Cycles ne voit pas la carte et `check_setup.py` le signale.
+- **Serveur sans écran** : aucun problème, tout se fait en ligne de commande (`blender -b`).
+- **WSL2** : non recommandé pour les rendus. Préfère Windows directement ou un vrai Linux.
 
 ## Fichiers de ce dossier
 

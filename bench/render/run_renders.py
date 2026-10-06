@@ -11,8 +11,11 @@ lue dans bench/render/cameras/<jeu>.json. Sorties : data/renders/<jeu>/<label>/.
 Un rendu déjà présent n'est pas refait : on peut interrompre et relancer.
 """
 import argparse
+import glob
 import json
 import os
+import platform
+import shutil
 import subprocess
 import sys
 import time
@@ -22,7 +25,26 @@ ROOT = Path(__file__).resolve().parents[2]
 DATA = ROOT / "data"
 CAMERAS = Path(__file__).parent / "cameras"
 SCRIPT = Path(__file__).parent / "render_bench.py"
-DEFAULT_BLENDER = r"C:\Program Files\Blender Foundation\Blender 5.0\blender.exe"
+
+
+def find_blender():
+    """Blender 5.0 : variable BLENDER, sinon emplacements habituels (Windows, Linux)."""
+    if os.environ.get("BLENDER"):
+        return os.environ["BLENDER"]
+    if platform.system() == "Windows":
+        return r"C:\Program Files\Blender Foundation\Blender 5.0\blender.exe"
+    # Linux : archive officielle décompressée (~/blender-5.0.1-linux-x64/blender),
+    # /opt, ou un « blender » dans le PATH.
+    home = os.path.expanduser("~")
+    for pattern in (f"{home}/blender-5.0*/blender", f"{home}/*/blender-5.0*/blender",
+                    "/opt/blender-5.0*/blender", "/opt/blender*/blender"):
+        hits = sorted(glob.glob(pattern))
+        if hits:
+            return hits[-1]
+    return shutil.which("blender") or "blender"
+
+
+DEFAULT_BLENDER = find_blender()
 
 # jeu -> (chemin sous data/, type, nombre d'images rendues)
 DATASETS = {
@@ -42,7 +64,7 @@ DATASETS = {
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--blender", default=os.environ.get("BLENDER", DEFAULT_BLENDER))
+    ap.add_argument("--blender", default=DEFAULT_BLENDER)
     ap.add_argument("--only", nargs="+", choices=list(DATASETS))
     ap.add_argument("--labels", nargs="+", default=["orig", "seedB"],
                     choices=["orig", "seedB", "decoded"])

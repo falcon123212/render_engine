@@ -8,6 +8,7 @@ Termine par « PRÊT » ou par la liste de ce qui manque.
 """
 import argparse
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -29,11 +30,12 @@ def check(ok, label, detail="", fatal=True):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--blender", default=os.environ.get("BLENDER", DEFAULT_BLENDER))
+    ap.add_argument("--blender", default=DEFAULT_BLENDER)
     args = ap.parse_args()
 
     print("Système")
     check(sys.version_info >= (3, 10), "Python 3.10 ou plus", sys.version.split()[0])
+    check(platform.system() in ("Windows", "Linux"), "Système Windows ou Linux", platform.system())
     free = shutil.disk_usage(DATA.parent).free / 1e9
     check(free > 5, "Espace disque libre > 5 Go", f"{free:.0f} Go")
     try:
@@ -45,7 +47,7 @@ def main():
 
     print("Blender")
     blender = Path(args.blender)
-    if check(blender.exists(), "Blender trouvé", str(blender)):
+    if check(blender.exists(), "Blender trouvé", f"{blender} (sinon --blender CHEMIN)"):
         out = subprocess.run([str(blender), "--version"], capture_output=True, text=True,
                              timeout=120).stdout
         m = re.search(r"Blender (\d+\.\d+\.\d+)", out)
