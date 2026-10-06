@@ -5,7 +5,8 @@ nouveau format de compression de caches 3D. Plus tard, on rendra les mêmes scè
 compression et décompression, puis on comparera les images pixel par pixel (outil ꟻLIP
 de NVIDIA). Tout est automatisé : il n'y a aucun réglage à faire dans Blender.
 
-**En résumé : 4 commandes, environ 30 minutes au total sur une RTX 5070.**
+**En résumé : 5 commandes (vérifier, tester, rendre, contrôler, empaqueter), environ 30 minutes
+au total sur une RTX 5070.**
 
 ## Ce qu'il te faut
 
@@ -108,15 +109,101 @@ python bench/render/run_renders.py
   qui est déjà rendu n'est pas refait.
 - À la fin, chaque ligne doit indiquer `OK`. Le bilan est dans `data/renders/report.json`.
 
-## Étape 5 : renvoyer les résultats
+## Étape 5 : vérifier les sorties
+
+```bash
+python bench/render/verify_renders.py
+```
+
+Le script contrôle, pour chaque jeu et chaque passe (`orig`, `seedB`) :
+
+- que toutes les images attendues sont là, avec les bons numéros ;
+- qu'elles sont bien en 3840 × 2160 ;
+- qu'elles ont été rendues avec Blender 5.0.x, sur la carte et non sur le processeur.
+
+Il doit finir par **`COMPLET : 98 images`**. S'il affiche `INCOMPLET`, relance l'étape 4 :
+elle ne refait que ce qui manque. Après le test rapide, la même vérification se fait avec
+`--quick`, et elle doit finir par `COMPLET : 18 images`.
+
+## Étape 6 : renvoyer les résultats
 
 ```bash
 python bench/render/pack_inputs.py --renders
 ```
 
-Envoie **`data\renders.zip`** à Nicolas (environ 1 Go).
+Envoie **`data/renders.zip`** à Nicolas (environ 1 Go).
 
-## Ce qui est rendu
+## Ce que tu dois rendre et ce qui doit sortir
+
+### En résumé
+
+| Jeu | Passes | Images par passe | Résolution | Total |
+|---|---|---|---|---|
+| vlasic_samba | orig + seedB | 12 | 3840 × 2160 | 24 PNG |
+| vlasic_bouncing | orig + seedB | 12 | 3840 × 2160 | 24 PNG |
+| vlasic_march_I | orig + seedB | 12 | 3840 × 2160 | 24 PNG |
+| cloth_violent | orig + seedB | 12 | 3840 × 2160 | 24 PNG |
+| disney_cloud | orig + seedB | 1 | 3840 × 2160 | 2 PNG |
+| **Total** | | | | **98 PNG** |
+
+### Arborescence attendue
+
+Chaque PNG porte le **numéro de l'image dans la séquence**, sur 4 chiffres.
+
+```text
+data/renders/
+├── report.json                  bilan du lanceur (OK/ÉCHEC et durée par jeu)
+├── vlasic_samba/
+│   ├── orig/
+│   │   ├── 0001.png  0017.png  0033.png  0048.png  0064.png  0080.png
+│   │   ├── 0096.png  0112.png  0128.png  0143.png  0159.png  0175.png
+│   │   └── timings.json         temps par image, Blender, carte, graine, échantillons
+│   ├── seedB/                   mêmes 12 noms de fichiers + timings.json
+│   ├── orig.log                 journal Blender (utile en cas d'erreur)
+│   └── seedB.log
+├── vlasic_bouncing/             mêmes numéros que vlasic_samba
+├── vlasic_march_I/
+│   └── orig/ et seedB/          0001 0024 0046 0069 0092 0114 0137 0159 0182 0205 0227 0250
+├── cloth_violent/
+│   └── orig/ et seedB/          0001 0012 0023 0033 0044 0055 0066 0077 0088 0098 0109 0120
+└── disney_cloud/
+    └── orig/ et seedB/          0001.png uniquement
+```
+
+### Contenu attendu des images
+
+| Jeu | À quoi ça doit ressembler |
+|---|---|
+| vlasic_* | Une personne grise et lisse sur fond gris foncé, entière dans le cadre, dans une pose qui change d'une image à l'autre |
+| cloth_violent | Un drapeau gris avec des plis lisses, qui ondule d'une image à l'autre |
+| disney_cloud | Un nuage gris doux au centre ; jamais une image entièrement noire |
+
+`orig` et `seedB` doivent paraître **identiques à l'œil nu**. Seul le grain du bruit change,
+et c'est voulu.
+
+### Fichier `timings.json` (un par passe)
+
+```json
+{
+  "frames": [1, 17, 33, "..."],
+  "seconds": {"1": 12.4, "17": 12.1},
+  "seed": 1,
+  "samples": 256,
+  "resolution": [3840, 2160],
+  "blender": "5.0.1",
+  "devices": ["NVIDIA GeForce RTX 5070"]
+}
+```
+
+`seed` vaut 1 pour `orig` et 1001 pour `seedB`. `devices` doit citer la carte : une liste vide
+voudrait dire un rendu sur le processeur, donc invalide.
+
+### Ce que contient `renders.zip`
+
+Tout le dossier `data/renders/` (PNG, `timings.json`, journaux, `report.json`), plus les
+caméras `bench/render/cameras/*.json`.
+
+## Réglages des rendus
 
 Tous les rendus complets sont en **4K entière (3840 × 2160)**, avec Cycles OptiX,
 **256 échantillons fixes**, sans débruitage, en PNG 8 bits avec la vue AgX. Chaque image est
@@ -162,7 +249,8 @@ Nicolas t'enverra les jeux décodés, avec la même arborescence que `data/`. La
 python bench/render/run_renders.py --labels decoded --decoded-root chemin/vers/decoded/data
 ```
 
-Ensuite, renvoie les résultats de la même façon (étape 5).
+Ensuite, vérifie avec `python bench/render/verify_renders.py --labels decoded` et renvoie
+les résultats de la même façon (étape 6).
 
 ## Linux : points d'attention
 
@@ -186,6 +274,7 @@ Ensuite, renvoie les résultats de la même façon (étape 5).
 | `check_setup.py` | Vérifie la machine avant tout |
 | `run_renders.py` | Lanceur : tous les jeux, avec reprise automatique |
 | `render_bench.py` | Rendu d'un jeu dans Blender (appelé par le lanceur) |
+| `verify_renders.py` | Contrôle des sorties (images, résolution, carte) avant l'envoi |
 | `pack_inputs.py` | Archives : données à envoyer, rendus à renvoyer |
 | `cameras/*.json` | Caméras figées, une par jeu |
 | `pixel_error.py` | Erreur en pixels sans rendu (utilisé par Nicolas, pas pour les rendus) |
