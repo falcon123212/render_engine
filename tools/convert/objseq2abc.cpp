@@ -166,8 +166,10 @@ int main(int argc, char** argv)
     {
         fs::create_directories(outPath.parent_path().empty() ? "." : outPath.parent_path());
         Abc::OArchive archive(AbcCoreOgawa::WriteArchive(), outPath.string());
+        // Premier échantillon à t = 1/fps : image 1 dans Blender (même
+        // convention que ses exports Alembic), sinon tout est décalé d'une image.
         const uint32_t ts = archive.addTimeSampling(
-            AbcCoreAbstract::TimeSampling(1.0 / fps, 0.0));
+            AbcCoreAbstract::TimeSampling(1.0 / fps, 1.0 / fps));
         AbcGeom::OPolyMesh mesh(archive.getTop(), name, ts);
         auto& schema = mesh.getSchema();
 
