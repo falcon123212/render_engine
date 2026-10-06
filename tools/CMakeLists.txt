@@ -16,6 +16,13 @@ target_link_libraries(depcheck PRIVATE
 # Active la conversion OpenVDB -> NanoVDB dans les en-têtes NanoVDB.
 target_compile_definitions(depcheck PRIVATE NANOVDB_USE_OPENVDB)
 
+# Conversion des jeux de données vers les références du banc.
+add_executable(objseq2abc convert/objseq2abc.cpp)
+target_link_libraries(objseq2abc PRIVATE Alembic::Alembic)
+
+add_executable(vdbnorm convert/vdbnorm.cpp)
+target_link_libraries(vdbnorm PRIVATE OpenVDB::openvdb)
+
 if(RDC_ENABLE_CUDA)
     add_executable(gpucheck gpucheck/main.cu)
 endif()

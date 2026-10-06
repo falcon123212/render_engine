@@ -58,6 +58,40 @@ build/tools/RelWithDebInfo/gpucheck.exe
 
 Le plugin est assemblé dans `build/plugin/` (`rdcUsd.dll` + `rdcUsd/resources/plugInfo.json`).
 
+## Jeux de données du banc
+
+Tout est écrit sous `data/` (exclu de git).
+
+1. Jeux publics : Vlasic et al. 2008 (10 séquences, 438 Mo) et nuage Disney (2,97 Go,
+   seules les résolutions 1/2, 1/4 et 1/8 sont gardées).
+
+```bash
+python bench/datasets/download.py
+```
+
+2. Conversion en références du banc : Alembic « topologie + positions » et VDB float32 Blosc.
+
+```bash
+python bench/datasets/convert.py vlasic disney
+```
+
+3. Jeux synthétiques (Blender 5.0, à lancer le soir) : tissu violent, personnage héros,
+   foule, fumée Mantaflow. `--quick` vérifie la chaîne en quelques minutes.
+
+```bash
+python bench/datasets/generate.py --character chemin/vers/perso.fbx
+```
+
+4. Mesures de mouvement (vitesse, résidu de l'extrapolation linéaire) d'Alembic existants,
+   écrites dans leur manifeste `.json` :
+
+```bash
+"C:\Program Files\Blender Foundation\Blender 5.0\blender.exe" -b --factory-startup --python bench/datasets/blender/abc_stats.py -- data/bench/geom/vlasic_samba.abc
+```
+
+Outils C++ utilisés : `objseq2abc` (séquence OBJ vers Alembic) et `vdbnorm`
+(`--list` pour inspecter les grilles d'un VDB).
+
 ## Tests du plugin dans Blender
 
 ```bash
