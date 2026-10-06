@@ -5,7 +5,7 @@ nouveau format de compression de caches 3D. Plus tard, on rendra les mêmes scè
 compression et décompression, puis on comparera les images pixel par pixel (outil ꟻLIP
 de NVIDIA). Tout est automatisé : il n'y a aucun réglage à faire dans Blender.
 
-**En résumé : 5 commandes (vérifier, tester, rendre, contrôler, empaqueter), environ 30 minutes
+**En résumé : 5 commandes (vérifier, tester, rendre, contrôler, empaqueter), environ 45 minutes
 au total sur une RTX 5070.**
 
 ## Ce qu'il te faut
@@ -98,7 +98,7 @@ Chaque ligne doit indiquer `OK`. Regarde ensuite les petites images dans
 - `cloth_violent` : un drapeau gris aux plis lisses ;
 - `disney_cloud` : un nuage gris doux, et non une image noire.
 
-## Étape 4 : rendus complets (environ 20 à 25 minutes sur une RTX 5070)
+## Étape 4 : rendus complets (environ 40 minutes sur une RTX 5070)
 
 ```bash
 python bench/render/run_renders.py
@@ -121,9 +121,9 @@ Le script contrôle, pour chaque jeu et chaque passe (`orig`, `seedB`) :
 - qu'elles sont bien en 3840 × 2160 ;
 - qu'elles ont été rendues avec Blender 5.0.x, sur la carte et non sur le processeur.
 
-Il doit finir par **`COMPLET : 98 images`**. S'il affiche `INCOMPLET`, relance l'étape 4 :
+Il doit finir par **`COMPLET : 122 images`**. S'il affiche `INCOMPLET`, relance l'étape 4 :
 elle ne refait que ce qui manque. Après le test rapide, la même vérification se fait avec
-`--quick`, et elle doit finir par `COMPLET : 18 images`.
+`--quick`, et elle doit finir par `COMPLET : 22 images`.
 
 ## Étape 6 : renvoyer les résultats
 
@@ -131,7 +131,7 @@ elle ne refait que ce qui manque. Après le test rapide, la même vérification 
 python bench/render/pack_inputs.py --renders
 ```
 
-Envoie **`data/renders.zip`** à Nicolas (environ 1 Go).
+Envoie **`data/renders.zip`** à Nicolas (environ 1,5 Go).
 
 ## Ce que tu dois rendre et ce qui doit sortir
 
@@ -143,8 +143,9 @@ Envoie **`data/renders.zip`** à Nicolas (environ 1 Go).
 | vlasic_bouncing | orig + seedB | 12 | 3840 × 2160 | 24 PNG |
 | vlasic_march_I | orig + seedB | 12 | 3840 × 2160 | 24 PNG |
 | cloth_violent | orig + seedB | 12 | 3840 × 2160 | 24 PNG |
+| smoke | orig + seedB | 12 | 3840 × 2160 | 24 PNG |
 | disney_cloud | orig + seedB | 1 | 3840 × 2160 | 2 PNG |
-| **Total** | | | | **98 PNG** |
+| **Total** | | | | **122 PNG** |
 
 ### Arborescence attendue
 
@@ -166,6 +167,8 @@ data/renders/
 │   └── orig/ et seedB/          0001 0024 0046 0069 0092 0114 0137 0159 0182 0205 0227 0250
 ├── cloth_violent/
 │   └── orig/ et seedB/          0001 0012 0023 0033 0044 0055 0066 0077 0088 0098 0109 0120
+├── smoke/
+│   └── orig/ et seedB/          mêmes numéros que cloth_violent (120 images)
 └── disney_cloud/
     └── orig/ et seedB/          0001.png uniquement
 ```
@@ -176,6 +179,7 @@ data/renders/
 |---|---|
 | vlasic_* | Une personne grise et lisse sur fond gris foncé, entière dans le cadre, dans une pose qui change d'une image à l'autre |
 | cloth_violent | Un drapeau gris avec des plis lisses, qui ondule d'une image à l'autre |
+| smoke | Un panache de fumée gris clair qui monte et grossit d'une image à l'autre (très fin à l'image 1) |
 | disney_cloud | Un nuage gris doux au centre ; jamais une image entièrement noire |
 
 `orig` et `seedB` doivent paraître **identiques à l'œil nu**. Seul le grain du bruit change,
@@ -218,17 +222,19 @@ rendue **deux fois** :
 | vlasic_bouncing | Humain qui saute, 10 k sommets | 175 images | 1, 17, 33, 48, 64, 80, 96, 112, 128, 143, 159, 175 | 24 |
 | vlasic_march_I | Humain qui marche, 10 k sommets | 250 images | 1, 24, 46, 69, 92, 114, 137, 159, 182, 205, 227, 250 | 24 |
 | cloth_violent | Drapeau dans le vent, 64 k sommets | 120 images | 1, 12, 23, 33, 44, 55, 66, 77, 88, 98, 109, 120 | 24 |
+| smoke | Fumée Mantaflow 256, jusqu'à 6 M voxels | 120 images | 1, 12, 23, 33, 44, 55, 66, 77, 88, 98, 109, 120 | 24 |
 | disney_cloud | Nuage statique, 24 M voxels | 1 image | 1 | 2 |
-| **Total** | | | **49 images** | **98 rendus** |
+| **Total** | | | **61 images** | **122 rendus** |
 
-Durée : environ 21 s par rendu de géométrie sur RTX 4060 (mesuré), soit environ 35 à
-40 minutes en tout. Sur RTX 5070, compter environ 20 à 25 minutes (estimation).
+Durée : environ 21 s par rendu de géométrie et environ 1 min 20 s par rendu de fumée sur
+RTX 4060 (estimation pour la fumée), soit environ 1 h 10 en tout. Sur RTX 5070, compter
+environ 40 minutes (estimation).
 
 Le test rapide (`--quick`) rend 2 images par jeu (la première et la dernière) en 960 × 540,
 avec 64 échantillons.
 
 **Plus tard**, Nicolas pourra t'envoyer de nouveaux jeux : personnage, foule, tissu lent,
-fumée, explosion, soit 120 rendus de plus (environ 1 h 30 à 2 h 30). Il suffira de
+explosion, soit 96 rendus de plus. Il suffira de
 décompresser la nouvelle archive, de faire `git pull`, puis de relancer l'étape 4 : seuls les
 nouveaux jeux seront rendus.
 
