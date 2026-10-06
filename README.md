@@ -20,16 +20,40 @@ git clone --depth 1 --branch v5.0.1 --filter=blob:none --sparse https://projects
 git -C external/lib-windows_x64 sparse-checkout set usd tbb python
 ```
 
-## Compilation
+## vcpkg (une fois)
 
-Seules les configurations `Release` et `RelWithDebInfo` existent (CRT /MD comme Blender).
+Dépendances : zstd, meshoptimizer, Alembic, ZFP, OpenVDB + NanoVDB, Catch2 (voir `vcpkg.json`,
+baseline figée). Triplet `x64-windows-release` (pas de Debug) et 6 jobs pour tenir dans 16 Go.
 
 ```bash
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+git clone https://github.com/microsoft/vcpkg.git external/vcpkg
 ```
 
 ```bash
-cmake --build build --config RelWithDebInfo
+external/vcpkg/bootstrap-vcpkg.bat -disableMetrics
+```
+
+## Compilation
+
+Seules les configurations `Release` et `RelWithDebInfo` existent (CRT /MD comme Blender).
+Le premier `configure` installe les dépendances vcpkg (long : OpenVDB, Boost).
+
+```bash
+cmake --preset default
+```
+
+```bash
+cmake --build --preset default
+```
+
+## Vérifications de l'environnement
+
+```bash
+build/tools/RelWithDebInfo/depcheck.exe
+```
+
+```bash
+build/tools/RelWithDebInfo/gpucheck.exe
 ```
 
 Le plugin est assemblé dans `build/plugin/` (`rdcUsd.dll` + `rdcUsd/resources/plugInfo.json`).

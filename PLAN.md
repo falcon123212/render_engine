@@ -206,6 +206,12 @@ Render_Engine/
   - rendu Cycles OptiX.
 
   Le repli par add-on Python devient inutile.
+- **6 oct. 2026 — dépendances et GPU validés.**
+  - vcpkg (version figée, triplet release, 6 jobs) installe 83 paquets en 15 min. `depcheck` passe pour zstd 1.5.7, meshoptimizer, ZFP 1.0.1, OpenVDB 12.0.1, NanoVDB 32.7 et Alembic 1.8.12.
+  - `gpucheck` :
+    - débit hôte vers GPU de **6,6 Go/s** avec de la mémoire épinglée, ce qui confirme le PCIe 3.0 x8 ;
+    - **39 µs** par lancement de noyau avec synchronisation (pilote WDDM), donc il faut grouper les noyaux par image ;
+    - 1,2 Mo non compressé envoyé et déquantifié en **0,23 ms**. Le critère « ≤ 1 ms » pour le personnage a donc de la marge, avant même la compression.
 
 ## Choix par défaut
 
