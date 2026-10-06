@@ -94,17 +94,26 @@ def load_geometry(path, fps):
     return objs, scene.frame_end
 
 
+def frame_number(path):
+    digits = "".join(c if c.isdigit() else " " for c in path.stem).split()
+    return int(digits[-1]) if digits else 1
+
+
 def load_volume(folder):
-    files = sorted(Path(folder).glob("*.vdb"))
+    """Séquence <prefixe>_NNNN.vdb. Les images sont repérées par leur numéro :
+    le dossier peut ne contenir que les images à rendre (archive allégée)."""
+    files = sorted(Path(folder).glob("*.vdb"), key=frame_number)
+    last = frame_number(files[-1])
     vol = bpy.data.volumes.new("Volume")
     vol.filepath = str(files[0])
     vol.is_sequence = len(files) > 1
     if vol.is_sequence:
-        vol.frame_start, vol.frame_duration = 1, len(files)
+        vol.frame_start, vol.frame_duration, vol.frame_offset = 1, last, 0
     obj = common.link(bpy.data.objects.new("Volume", vol))
     vol.materials.append(volume_material())
-    bpy.context.scene.frame_end = len(files)
-    return [obj], len(files)
+    bpy.context.scene.frame_end = last
+    available = {frame_number(f) for f in files}
+    return [obj], last, available
 
 
 def bbox_all_frames(objs, frames):
@@ -186,6 +195,11 @@ def setup_render(args):
 
 
 args = common.parse_args(configure)
+# Chemins absolus : Blender lit les chemins de volume relativement au .blend
+# (inexistant ici), un chemin relatif donnerait un volume vide sans erreur.
+for attr in ("abc", "vdb", "camera", "out"):
+    if getattr(args, attr):
+        setattr(args, attr, str(Path(getattr(args, attr)).resolve()))
 if bool(args.abc) == bool(args.vdb):
     sys.exit("--abc ou --vdb (un seul)")
 bpy.ops.wm.read_factory_settings(use_empty=True)
@@ -194,19 +208,25 @@ if args.abc:
     fps = json.loads(manifest.read_text(encoding="utf-8")).get("fps", args.fps) \
         if manifest.exists() else args.fps
     objs, nframes = load_geometry(args.abc, fps)
+    available = set(range(1, nframes + 1))
 else:
-    objs, nframes = load_volume(args.vdb)
+    objs, nframes, available = load_volume(args.vdb)
 if args.max_frames:
     nframes = min(nframes, args.max_frames)
 
 frames = args.at or sorted({1 + round(i * (nframes - 1) / max(1, args.count - 1))
                             for i in range(min(args.count, nframes))})
+missing = [f for f in frames if f not in available]
+if missing:
+    sys.exit(f"images absentes des données : {missing}")
 setup_render(args)
-spec = make_camera(Path(args.camera), objs, range(1, nframes + 1), args.res)
+spec = make_camera(Path(args.camera), objs, sorted(available), args.res)
 if args.vdb:
     # Densité de rendu inversement proportionnelle à la taille du volume, pour
     # une épaisseur optique comparable (référence : densité 4 pour ~5 m de rayon).
     radius = (Vector(spec["bbox_max"]) - Vector(spec["bbox_min"])).length / 2
+    if radius <= 0:
+        sys.exit("volume vide : aucune grille lue (chemin ou fichiers VDB invalides)")
     node = next(n for n in bpy.data.materials["RDC_Volume"].node_tree.nodes
                 if n.type == 'PRINCIPLED_VOLUME')
     node.inputs["Density"].default_value = spec.get("volume_density", 4.0 * 5.0 / radius)
