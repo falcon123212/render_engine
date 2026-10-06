@@ -23,6 +23,11 @@ target_link_libraries(objseq2abc PRIVATE Alembic::Alembic)
 add_executable(vdbnorm convert/vdbnorm.cpp)
 target_link_libraries(vdbnorm PRIVATE OpenVDB::openvdb)
 
+# Mesure des références du banc (volumes).
+add_executable(vdbref refs/vdbref.cpp)
+target_link_libraries(vdbref PRIVATE OpenVDB::openvdb OpenVDB::nanovdb zfp::zfp zstd::libzstd)
+target_compile_definitions(vdbref PRIVATE NANOVDB_USE_OPENVDB)
+
 if(RDC_ENABLE_CUDA)
     add_executable(gpucheck gpucheck/main.cu)
 endif()

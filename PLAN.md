@@ -107,7 +107,7 @@ Les caches Mantaflow sont exportés en OpenVDB **pleine précision (float32), Bl
 ### Métriques
 
 - **Courbes débit-distorsion** : 4 à 5 niveaux d'erreur par jeu, avec des métriques analytiques peu coûteuses (erreur maximale par sommet, erreur projetée en pixels pour la caméra 4K de référence, et PSNR plus erreur maximale pour les volumes).
-- **ꟻLIP** seulement au point de fonctionnement retenu, sur 24 images par jeu (une sur cinq), en 4K. On tone-mappe en AgX, puis on applique ꟻLIP LDR.
+- **ꟻLIP** seulement au point de fonctionnement retenu, sur **12 images par jeu en 4K entière**, pour 10 jeux : 3 séquences Vlasic (samba, bouncing, march), les 2 tissus, le héros, la foule, la fumée, l'explosion, plus 1 image du nuage statique. On tone-mappe en AgX, puis on applique ꟻLIP LDR. L'erreur en pixels, elle, est calculée sans rendu sur **toutes** les images (`bench/render/pixel_error.py`).
   - **Plancher de bruit** : on compare l'original rendu avec la graine A à l'original rendu avec la graine B.
   - **Mesure du codec** : on compare l'original au décodé, tous deux rendus avec la graine A, sans débruiteur et avec beaucoup d'échantillons.
 - **Stabilité temporelle** : on mesure la variation de l'erreur maximale d'une image à l'autre, en vérifiant spécialement les frontières de segment. On revoit aussi les cartes ꟻLIP en flipbook à 24 images/s.
@@ -121,7 +121,7 @@ Les caches Mantaflow sont exportés en OpenVDB **pleine précision (float32), Bl
 | Disque : volumes et références | ~40 Go (fumée et explosion) |
 | Disque : nuage, rendus PNG 4K, décodés temporaires | ~10 Go |
 | **Total disque** | **≤ 60 Go** sur 126 Go libres |
-| Rendus ꟻLIP | 7 jeux × 24 images × 3 rendus ≈ 500 rendus, soit **2 à 3 nuits** sur la 4060 avec OptiX |
+| Rendus ꟻLIP | 109 images × 3 rendus ≈ 330 rendus en 4K entière : géométrie ~21 s par rendu (mesuré), volumes 1 à 2 min (estimé), soit **3 à 4 h** |
 | Bakes | Mantaflow 256 et les deux tissus : **1 à 2 nuits** |
 
 ## Critères de réussite
@@ -212,6 +212,12 @@ Render_Engine/
     - débit hôte vers GPU de **6,6 Go/s** avec de la mémoire épinglée, ce qui confirme le PCIe 3.0 x8 ;
     - **39 µs** par lancement de noyau avec synchronisation (pilote WDDM), donc il faut grouper les noyaux par image ;
     - 1,2 Mo non compressé envoyé et déquantifié en **0,23 ms**. Le critère « ≤ 1 ms » pour le personnage a donc de la marge, avant même la compression.
+
+- **6 oct. 2026 — premières références mesurées** (`bench/refs/measure_refs.py`, résultats dans `data/results/refs/`).
+  - Géométrie : Alembic Ogawa ≈ 97 bits par sommet et par image ; zstd n'apporte que 1,1 à 1,2× (82 à 88 bits) ; `.usdc` ≈ 96 bits. Viser 8× contre Ogawa revient donc à environ 12 bits par sommet et par image.
+  - Nuage Disney 1/4, à erreur maximale égale à celle de Fp8 : NanoVDB Fp8 fait 1,9× mieux qu'OpenVDB Blosc, ZFP par feuille 2,3×, et **Fp8 + zstd 4,0×**. Le critère « ≥ 2× contre Fp8 » est donc trop facile : un simple zstd sur Fp8 le franchit déjà. Il faudra le recaler contre Fp8 + zstd au gel des critères.
+  - Rendu : image 4K entière de géométrie en 21 s, zone 960 × 540 en 2 s (4060, 256 échantillons). On retient la 4K entière avec 12 images par jeu. L'ombrage lissé supprime les facettes du tissu violent, qu'on garde donc tel quel.
+  - Erreur en pixels, sur le tissu violent avec la caméra du banc : 0,5 px en 4K correspond à environ 0,15 mm, soit 4e-5 de la diagonale. Le budget est serré par rapport au résidu de prédiction (1,7e-3) : le tissu violent restera plutôt vers 5× que 8×, ce qui reste cohérent avec sa cible du plan.
 
 ## Choix par défaut
 
