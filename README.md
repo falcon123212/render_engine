@@ -1,6 +1,6 @@
 # Render_Engine — codec .rdc (prototype)
 
-Plan complet : [PLAN.md](PLAN.md).
+Plan complet : [PLAN.md](PLAN.md). Suivi (fait, à faire, décisions) : [JOURNAL.md](JOURNAL.md).
 
 ## Prérequis
 

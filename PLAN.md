@@ -199,6 +199,9 @@ Render_Engine/
 
 ## Avancement
 
+Le suivi détaillé (fait, à faire, décisions à approuver, constats) est tenu dans
+[JOURNAL.md](JOURNAL.md). Les jalons ci-dessous en sont un résumé.
+
 - **6 oct. 2026 — porte « plugin dans Blender » franchie.** Le plugin minimal `rdcUsd` (`src/usd_plugin/`) est compilé contre les bibliothèques de Blender 5.0.1. Les 10 tests de `tests/usd/run_blender_tests.ps1` passent :
   - découverte du plugin ;
   - `Usd.Stage.Open` avec 48 time samples exacts ;
