@@ -252,19 +252,117 @@ python bench/render/run_renders.py --labels decoded --decoded-root chemin/vers/d
 Ensuite, vérifie avec `python bench/render/verify_renders.py --labels decoded` et renvoie
 les résultats de la même façon (étape 6).
 
+## Mode headless (sans interface)
+
+**Tout est déjà headless.** Le lanceur démarre Blender en arrière-plan (`blender -b`) :
+aucune fenêtre ne s'ouvre, aucun écran n'est nécessaire, et l'interface de Blender n'est
+jamais utilisée. Ça marche donc aussi sur un serveur sans écran, en SSH ou en bureau à
+distance.
+
+### Lancer en arrière-plan et pouvoir se déconnecter
+
+Linux, avec `nohup` (les rendus continuent après la déconnexion SSH) :
+
+```bash
+nohup python3 bench/render/run_renders.py > rendus.log 2>&1 &
+```
+
+```bash
+tail -f rendus.log
+```
+
+Linux, avec `tmux` (on peut revenir voir la session plus tard avec `tmux attach -t rendus`) :
+
+```bash
+tmux new -s rendus "python3 bench/render/run_renders.py; bash"
+```
+
+Windows (PowerShell) : lancement dans une fenêtre réduite, avec un journal :
+
+```powershell
+Start-Process -WindowStyle Minimized python -ArgumentList "bench/render/run_renders.py" -RedirectStandardOutput rendus.log -RedirectStandardError rendus_err.log
+```
+
+```powershell
+Get-Content rendus.log -Wait
+```
+
+### Suivre l'avancement
+
+- Le journal du lanceur affiche `[jeu/passe] ... OK en X min` pour chaque passe.
+- Le détail par image, rendu par Blender (`image 17 : 12.3 s`), se trouve dans
+  `data/renders/<jeu>/<passe>.log`.
+- La charge de la carte s'affiche, rafraîchie toutes les 2 secondes, avec :
+
+```bash
+nvidia-smi -l 2
+```
+
+- Pour savoir où en est le travail, à tout moment et même pendant les rendus :
+
+```bash
+python bench/render/verify_renders.py
+```
+
+### Arrêter proprement
+
+Ctrl+C dans le terminal, ou tuer le processus Python **et** Blender (`pkill -f run_renders`
+puis `pkill blender` sous Linux, ou le Gestionnaire des tâches sous Windows). L'image en
+cours est perdue, mais les autres restent : relancer la même commande reprend là où ça
+s'est arrêté.
+
+### Commande Blender brute (pour un seul jeu, sans le lanceur)
+
+C'est la commande exacte qu'exécute `run_renders.py`, utile pour déboguer un jeu. Exemple
+pour la passe `orig` du drapeau.
+
+Windows :
+
+```powershell
+& "C:\Program Files\Blender Foundation\Blender 5.0\blender.exe" -b --factory-startup --python-exit-code 1 --python bench/render/render_bench.py -- --abc data/bench/geom/cloth_violent.abc --camera bench/render/cameras/cloth_violent.json --label orig --out data/renders/cloth_violent --count 12
+```
+
+Linux :
+
+```bash
+~/blender-5.0.1-linux-x64/blender -b --factory-startup --python-exit-code 1 --python bench/render/render_bench.py -- --abc data/bench/geom/cloth_violent.abc --camera bench/render/cameras/cloth_violent.json --label orig --out data/renders/cloth_violent --count 12
+```
+
+| Option (après `--`) | Rôle |
+|---|---|
+| `--abc FICHIER` ou `--vdb DOSSIER` | Géométrie Alembic, ou séquence de volumes VDB |
+| `--camera FICHIER` | Caméra figée du jeu (ne pas modifier) |
+| `--label orig\|seedB\|decoded` | Passe : `seedB` change la graine (1001 au lieu de 1) |
+| `--out DOSSIER` | Les images vont dans `DOSSIER/<label>/NNNN.png` |
+| `--count 12` | Nombre d'images réparties sur la séquence |
+| `--at 1 60 120` | Ou bien : numéros d'images précis |
+| `--res 3840 2160` / `--samples 256` | Valeurs par défaut : ne pas changer pour le banc |
+
+Options de Blender utilisées :
+
+| Option | Rôle |
+|---|---|
+| `-b` | Headless : pas d'interface |
+| `--factory-startup` | Ignore les préférences et add-ons personnels (rendus reproductibles) |
+| `--python-exit-code 1` | Code de sortie 1 si le script échoue (détecté par le lanceur) |
+
+### Plusieurs cartes graphiques
+
+Par défaut, Cycles utilise toutes les cartes OptiX. Pour n'en utiliser qu'une, par exemple
+la première :
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python3 bench/render/run_renders.py
+```
+
+Sous Windows : `$env:CUDA_VISIBLE_DEVICES="0"` avant la commande. `timings.json` indique
+quelle carte a servi. Les rendus décodés devront être faits sur la **même** carte.
+
 ## Linux : points d'attention
 
-- **Lancer les rendus en arrière-plan** (par exemple en SSH), pour qu'ils continuent après
-  la déconnexion :
-
-  ```bash
-  nohup python3 bench/render/run_renders.py > rendus.log 2>&1 &
-  ```
-
-  Suis l'avancement avec `tail -f rendus.log`.
 - **Pilote** : `nvidia-smi` doit afficher la carte. Sans le pilote propriétaire NVIDIA
   (avec nouveau), Cycles ne voit pas la carte et `check_setup.py` le signale.
-- **Serveur sans écran** : aucun problème, tout se fait en ligne de commande (`blender -b`).
+- **Serveur sans écran** : aucun problème (voir « Mode headless »).
 - **WSL2** : non recommandé pour les rendus. Préfère Windows directement ou un vrai Linux.
 
 ## Fichiers de ce dossier
