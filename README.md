@@ -92,6 +92,10 @@ python bench/datasets/generate.py --character chemin/vers/perso.fbx
 Outils C++ utilisés : `objseq2abc` (séquence OBJ vers Alembic) et `vdbnorm`
 (`--list` pour inspecter les grilles d'un VDB).
 
+## Rendus de comparaison
+
+Guide pour lancer les rendus sur une autre machine : [bench/render/README.md](bench/render/README.md).
+
 ## Tests du plugin dans Blender
 
 ```bash

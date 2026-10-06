@@ -39,6 +39,8 @@ def configure(p):
     p.add_argument("--samples", type=int, default=256)
     p.add_argument("--res", type=int, nargs=2, default=[3840, 2160])
     p.add_argument("--max-frames", type=int, help="limite pour les tests")
+    p.add_argument("--camera-only", action="store_true",
+                   help="crée la caméra figée puis s'arrête (aucun rendu)")
 
 
 def smooth_modifier(obj):
@@ -142,6 +144,12 @@ def make_camera(cam_path, objs, all_frames, res):
         print(f"  caméra créée : {cam_path}")
     cam.location, cam.rotation_euler = spec["location"], spec["rotation_euler"]
     cam.data.lens, cam.data.sensor_width = spec["lens"], spec["sensor_width"]
+    # Plans de coupe adaptés à l'échelle (le nuage Disney mesure ~500 unités).
+    lo, hi = Vector(spec["bbox_min"]), Vector(spec["bbox_max"])
+    dist = (Vector(spec["location"]) - (lo + hi) / 2).length
+    radius = (hi - lo).length / 2
+    cam.data.clip_start = max(1e-3, (dist - radius) * 0.05)
+    cam.data.clip_end = dist + 2 * radius
     scene.camera = cam
     return spec
 
@@ -194,7 +202,17 @@ if args.max_frames:
 frames = args.at or sorted({1 + round(i * (nframes - 1) / max(1, args.count - 1))
                             for i in range(min(args.count, nframes))})
 setup_render(args)
-make_camera(Path(args.camera), objs, range(1, nframes + 1), args.res)
+spec = make_camera(Path(args.camera), objs, range(1, nframes + 1), args.res)
+if args.vdb:
+    # Densité de rendu inversement proportionnelle à la taille du volume, pour
+    # une épaisseur optique comparable (référence : densité 4 pour ~5 m de rayon).
+    radius = (Vector(spec["bbox_max"]) - Vector(spec["bbox_min"])).length / 2
+    node = next(n for n in bpy.data.materials["RDC_Volume"].node_tree.nodes
+                if n.type == 'PRINCIPLED_VOLUME')
+    node.inputs["Density"].default_value = spec.get("volume_density", 4.0 * 5.0 / radius)
+if args.camera_only:
+    print("CAMÉRA prête")
+    sys.exit(0)
 
 out = Path(args.out) / args.label
 out.mkdir(parents=True, exist_ok=True)
@@ -207,8 +225,9 @@ for f in frames:
     bpy.ops.render.render(write_still=True)
     timings[f] = round(time.time() - t0, 2)
     print(f"  image {f} : {timings[f]} s", flush=True)
-(out / "timings.json").write_text(json.dumps({"frames": frames, "seconds": timings,
-                                              "seed": scene.cycles.seed,
-                                              "samples": args.samples}, indent=2),
-                                  encoding="utf-8")
+prefs = bpy.context.preferences.addons["cycles"].preferences
+(out / "timings.json").write_text(json.dumps({
+    "frames": frames, "seconds": timings, "seed": scene.cycles.seed, "samples": args.samples,
+    "resolution": list(args.res), "blender": bpy.app.version_string,
+    "devices": [d.name for d in prefs.devices if d.use]}, indent=2), encoding="utf-8")
 print(f"RENDU {args.label} : {len(frames)} images, {sum(timings.values()):.0f} s")
