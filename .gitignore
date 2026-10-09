@@ -1,0 +1,10 @@
+windows/.sdk_path
+cuda/poc_gpu_l3
+cuda/poc_gpu_l8
+cuda/*.exe
+cuda/*.exp
+cuda/*.lib
+results/*
+!results/README.md
+*.zip
+__pycache__/

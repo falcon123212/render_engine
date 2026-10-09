@@ -1,0 +1,1345 @@
+diff --git a/Samples/Pathtracer/GlobalCb.h b/Samples/Pathtracer/GlobalCb.h
+index 8976dd5..57aa710 100644
+--- a/Samples/Pathtracer/GlobalCb.h
++++ b/Samples/Pathtracer/GlobalCb.h
+@@ -22,7 +22,7 @@ struct GlobalConstants
+     int frameIndex;
+     uint enableAccumulation;
+     float recipAccumulatedFrames;
+-    float padding;
++    float benchBypassCache;   // banc : 1 = ne pas lire le cache SHaRC (contournement apres evenement)
+ 
+     int enableEmissives;
+     int enableLighting;
+@@ -55,6 +55,15 @@ struct GlobalConstants
+     float roughnessMax;
+     float metalnessMin;
+     float metalnessMax;
++
++    // banc : invalidation ciblee de SHaRC (masque de dependances par entree)
++    float4 benchGridMin;      // boite des zones de dependance (6 x 4 x 4 zones)
++    float4 benchGridMax;
++    uint4 benchInvMask;       // zones (xyz, 96 bits) et lampes (w, bit 31 = ciel) a invalider cette image
++    uint benchDepEnable;
++    uint benchDepBank;        // banque de masques ecrite cette image (0 ou 1)
++    uint benchPad1;
++    uint benchPad2;
+ };
+ 
+ #define EXIT_MAX_BOUNCE       0
+diff --git a/Samples/Pathtracer/Pathtracer.cpp b/Samples/Pathtracer/Pathtracer.cpp
+index 40975d1..5dc920c 100644
+--- a/Samples/Pathtracer/Pathtracer.cpp
++++ b/Samples/Pathtracer/Pathtracer.cpp
+@@ -23,6 +23,9 @@
+ #include <donut/engine/TextureCache.h>
+ 
+ #include <random>
++#include <filesystem>
++#include <algorithm>
++#include <GLFW/glfw3.h>
+ 
+ #include "AppUtils.h"
+ #include "Pathtracer.h"
+@@ -87,6 +90,37 @@ bool Pathtracer::Init(int argc, const char* const* argv)
+ 
+         if (!strcmp(arg, "-noaccumulation"))
+             m_ui.denoiserType = DenoiserType::None;
++        else if (!strcmp(arg, "-bench") && n + 1 < argc)
++        {
++            if (m_bench.Load(argv[n + 1]))
++            {
++                m_ui.samplesPerPixel = m_bench.spp;
++                m_ui.denoiserType = DenoiserType::Accumulation;
++#if ENABLE_NRD
++                if (m_bench.denoiser == "nrd") m_ui.denoiserType = DenoiserType::Nrd;
++#endif
++                if (m_bench.denoiser == "dlssrr") m_ui.denoiserType = DenoiserType::Dlssrr;
++                if (m_bench.dlss == "perf") m_ui.dlssMode = DlssMode::Performance;
++                else if (m_bench.dlss == "balanced") m_ui.dlssMode = DlssMode::Balanced;
++                else if (m_bench.dlss == "quality") m_ui.dlssMode = DlssMode::Quality;
++                else if (m_bench.dlss == "dlaa") m_ui.dlssMode = DlssMode::DLAA;
++                m_ui.enableAnimations = false;
++                m_ui.targetLight = -1;   // toutes les lampes echantillonnees (par defaut, l'exemple ne prend que la lampe 0 = soleil)
++                if (m_bench.sharcAccum > 0) m_ui.sharcAccumulationFrameNum = m_bench.sharcAccum;
++#if ENABLE_NRC
++                if (m_bench.nrcMaxRad > 0) m_ui.nrcMaxAverageRadiance = m_bench.nrcMaxRad;
++#endif
++                if (m_bench.tech == "none") m_ui.techSelection = TechSelection::None;
++#if ENABLE_NRC
++                if (m_bench.tech == "nrc") m_ui.techSelection = TechSelection::Nrc;
++#endif
++#if ENABLE_SHARC
++                if (m_bench.tech == "sharc") m_ui.techSelection = TechSelection::Sharc;
++#endif
++                log::info("Bench : mode %s, tech %s, %d images", m_bench.mode.c_str(), m_bench.tech.c_str(), (int)m_bench.seq.size());
++            }
++            else log::error("Bench : impossible de lire %s", argv[n + 1]);
++        }
+         else if (!strcmp(arg, "-scene"))
+             sceneName = (char*)argv[n + 1];
+         else if (!strcmp(arg, "-camera"))
+@@ -228,8 +262,19 @@ bool Pathtracer::Init(int argc, const char* const* argv)
+         nvrhi::BindingLayoutItem::StructuredBuffer_UAV(1),
+         nvrhi::BindingLayoutItem::StructuredBuffer_UAV(2),
+         nvrhi::BindingLayoutItem::StructuredBuffer_UAV(3),
++        nvrhi::BindingLayoutItem::StructuredBuffer_UAV(4),   // banc : masques de dependances (banque 0)
++        nvrhi::BindingLayoutItem::StructuredBuffer_UAV(7),   // banc : masques de dependances (banque 1)
+     };
+     m_sharcBindingLayout = GetDevice()->createBindingLayout(bindingLayoutDesc);
++    // banc : instantanes compacts (hachage, resolu, enregistrements, compteur, constantes)
++    bindingLayoutDesc.bindings = {
++        nvrhi::BindingLayoutItem::StructuredBuffer_UAV(0),
++        nvrhi::BindingLayoutItem::StructuredBuffer_UAV(3),
++        nvrhi::BindingLayoutItem::StructuredBuffer_UAV(5),
++        nvrhi::BindingLayoutItem::StructuredBuffer_UAV(6),
++        nvrhi::BindingLayoutItem::PushConstants(0, 16),
++    };
++    m_benchSnapLayout = GetDevice()->createBindingLayout(bindingLayoutDesc);
+ #endif // ENABLE_SHARC
+ 
+     CreateCommonPipelines();
+@@ -271,12 +316,41 @@ bool Pathtracer::Init(int argc, const char* const* argv)
+         bufferDesc.debugName = "m_sharcResolvedBuffer";
+         m_sharcResolvedBuffer = GetDevice()->createBuffer(bufferDesc);
+ 
++        // banc : masque de dependances par entree (16 octets), alloue seulement si l'invalidation ciblee est active
++        bufferDesc.structStride = 4 * sizeof(uint32_t);
++        bufferDesc.byteSize = (m_bench.active && m_bench.depInv ? m_sharcEntriesNum : 1) * bufferDesc.structStride;
++        bufferDesc.debugName = "m_benchDepBuffer";
++        m_benchDepBuffer = GetDevice()->createBuffer(bufferDesc);
++        bufferDesc.debugName = "m_benchDepBuffer1";
++        m_benchDepBuffer1 = GetDevice()->createBuffer(bufferDesc);
++        bufferDesc.structStride = sizeof(uint32_t);
++        bufferDesc.byteSize = 4;
++        bufferDesc.debugName = "m_benchCounter";
++        m_benchCounter = GetDevice()->createBuffer(bufferDesc);
++        {
++            nvrhi::BufferDesc sd;
++            sd.byteSize = 4; sd.cpuAccess = nvrhi::CpuAccessMode::Read; sd.debugName = "m_benchCounterStaging";
++            m_benchCounterStaging = GetDevice()->createBuffer(sd);
++        }
++        {
++            auto mk = [&](const char* entry) {
++                nvrhi::ComputePipelineDesc pd;
++                pd.bindingLayouts = { m_benchSnapLayout };
++                pd.CS = m_shaderFactory->CreateShader("app/BenchSnap.hlsl", entry, nullptr, nvrhi::ShaderType::Compute);
++                return GetDevice()->createComputePipeline(pd); };
++            m_benchSnapCount = mk("snapCount");
++            m_benchSnapPack = mk("snapPack");
++            m_benchSnapRestore = mk("snapRestore");
++        }
++
+         nvrhi::BindingSetDesc bindingSetDesc;
+         bindingSetDesc.bindings = {
+             nvrhi::BindingSetItem::StructuredBuffer_UAV(0, m_sharcHashEntriesBuffer),
+             nvrhi::BindingSetItem::StructuredBuffer_UAV(1, m_sharcLockBuffer),
+             nvrhi::BindingSetItem::StructuredBuffer_UAV(2, m_sharcAccumulationBuffer),
+             nvrhi::BindingSetItem::StructuredBuffer_UAV(3, m_sharcResolvedBuffer),
++            nvrhi::BindingSetItem::StructuredBuffer_UAV(4, m_benchDepBuffer),
++            nvrhi::BindingSetItem::StructuredBuffer_UAV(7, m_benchDepBuffer1),
+         };
+         m_sharcBindingSet = GetDevice()->createBindingSet(bindingSetDesc, m_sharcBindingLayout);
+     }
+@@ -463,6 +537,7 @@ void Pathtracer::Render(nvrhi::IFramebuffer* framebuffer)
+     uint32_t outputWidth = fbInfo.width;
+     uint32_t outputHeight = fbInfo.height;
+     const uint32_t frameIndex = GetFrameIndex();
++    BenchBeginFrame();
+     const bool enableJitter = m_ui.enableJitter && (m_ui.denoiserType != DenoiserType::Nrd || m_ui.dlssMode != DlssMode::None);
+     const float2 pixelOffset = enableJitter ? GetPixelOffset(frameIndex) : float2(0.0f, 0.0f);
+     float renderScale = 1.0f;
+@@ -515,6 +590,12 @@ void Pathtracer::Render(nvrhi::IFramebuffer* framebuffer)
+     }
+ 
+     m_commandList->open();
++    if (m_bench.active)
++    {
++        if (!m_benchTimer) m_benchTimer = device->createTimerQuery();
++        else device->resetTimerQuery(m_benchTimer);
++        m_commandList->beginTimerQuery(m_benchTimer);
++    }
+ 
+     if (m_accelStructManager->NeedsRebuild())
+     {
+@@ -620,7 +701,7 @@ void Pathtracer::Render(nvrhi::IFramebuffer* framebuffer)
+         // Settings expected to change frequently that do not require instance reset
+         nrc::FrameSettings nrcPerFrameSettings;
+         nrcPerFrameSettings.maxExpectedAverageRadianceValue = m_ui.nrcMaxAverageRadiance;
+-        nrcPerFrameSettings.terminationHeuristicThreshold = m_ui.nrcTerminationHeuristicThreshold;
++        nrcPerFrameSettings.terminationHeuristicThreshold = (m_benchBypass > 0 && !m_benchCheckFrame && m_bench.bypassBounces == 0) ? 1e30f : m_ui.nrcTerminationHeuristicThreshold;   // contournement complet : aucune requete NRC
+         nrcPerFrameSettings.trainingTerminationHeuristicThreshold = m_ui.nrcTerminationHeuristicThreshold;
+         nrcPerFrameSettings.numTrainingIterations = m_ui.nrcNumTrainingIterations;
+         nrcPerFrameSettings.resolveMode = m_ui.nrcResolveMode;
+@@ -745,6 +826,14 @@ void Pathtracer::Render(nvrhi::IFramebuffer* framebuffer)
+     globalConstants.roughnessMax = std::max(m_ui.roughnessMin, m_ui.roughnessMax);
+     globalConstants.metalnessMin = m_ui.metalnessMin;
+     globalConstants.metalnessMax = std::max(m_ui.metalnessMin, m_ui.metalnessMax);
++    globalConstants.benchBypassCache = (m_benchBypass > 0 && !m_benchCheckFrame) ? (m_bench.bypassBounces > 0 ? float(m_bench.bypassBounces) : 100.0f) : 0.0f;
++
++    globalConstants.benchDepEnable = (m_bench.depInv && m_ui.techSelection == TechSelection::Sharc) ? 1u : 0u;
++    globalConstants.benchGridMin = float4(m_bench.gridMin[0], m_bench.gridMin[1], m_bench.gridMin[2], 0.f);
++    globalConstants.benchGridMax = float4(m_bench.gridMax[0], m_bench.gridMax[1], m_bench.gridMax[2], 0.f);
++    globalConstants.benchInvMask = dm::uint4(m_benchInv[0], m_benchInv[1], m_benchInv[2], m_benchInv[3]);
++    for (auto& v : m_benchInv) v = 0;   // l'invalidation ne dure qu'une image
++    globalConstants.benchDepBank = m_benchDepBank;
+ 
+     globalConstants.clamp = (uint)m_ui.toneMappingClamp;
+     globalConstants.toneMappingOperator = (uint)m_ui.toneMappingOperator;
+@@ -830,7 +919,7 @@ void Pathtracer::Render(nvrhi::IFramebuffer* framebuffer)
+ 
+         {
+             ScopedMarker scopedMarker(m_commandList, "NrcQueryPropagateTrain");
+-            m_nrc->QueryAndTrain(m_commandList, m_ui.nrcCalculateTrainingLoss);
++            m_benchLoss = m_nrc->QueryAndTrain(m_commandList, m_ui.nrcCalculateTrainingLoss);
+         }
+ 
+         if (m_ui.ptDebugOutput == PTDebugOutputType::None)
+@@ -862,6 +951,20 @@ void Pathtracer::Render(nvrhi::IFramebuffer* framebuffer)
+                 m_commandList->clearBufferUInt(m_sharcHashEntriesBuffer, m_sharcInvalidEntry);
+                 m_commandList->clearBufferUInt(m_sharcAccumulationBuffer, 0);
+                 m_commandList->clearBufferUInt(m_sharcResolvedBuffer, 0);
++                m_commandList->clearBufferUInt(m_benchDepBuffer, 0);
++                m_commandList->clearBufferUInt(m_benchDepBuffer1, 0);
++            }
++
++            // masques vieillissants : toutes les N images on change de banque et on vide celle qu'on va remplir
++            if (m_bench.active && m_bench.depInv)
++            {
++                const uint32_t period = m_bench.depReset > 0 ? (uint32_t)m_bench.depReset : 16u;
++                if (m_benchDepFrame % period == 0)
++                {
++                    m_benchDepBank = (m_benchDepFrame / period) % 2;
++                    m_commandList->clearBufferUInt(m_benchDepBank == 0 ? m_benchDepBuffer : m_benchDepBuffer1, 0);
++                }
++                m_benchDepFrame++;
+             }
+ 
+             // SHARC update
+@@ -978,6 +1081,8 @@ void Pathtracer::Render(nvrhi::IFramebuffer* framebuffer)
+             params.specularAlbedo = m_renderTargets->specularAlbedo;
+         }
+ 
++        params.resetHistory = m_benchDlssReset;   // banc : historique DLSS oublie a l'evenement
++        m_benchDlssReset = false;
+         m_dlss->Evaluate(m_commandList, params, m_view);
+     }
+ #endif // DONUT_WITH_DLSS
+@@ -1024,6 +1129,8 @@ void Pathtracer::Render(nvrhi::IFramebuffer* framebuffer)
+         m_commandList->draw(args);
+     }
+ 
++    if (m_bench.active && m_benchTimer)
++        m_commandList->endTimerQuery(m_benchTimer);
+     m_commandList->close();
+     device->executeCommandList(m_commandList);
+ 
+@@ -1041,6 +1148,514 @@ void Pathtracer::Render(nvrhi::IFramebuffer* framebuffer)
+ #endif // ENABLE_NRC
+ 
+     GetDeviceManager()->SetVsyncEnabled(m_ui.enableVSync);
++    BenchEndFrame();
++}
++
++// ------------------------------------------------------------------------------- banc d'essai
++void Pathtracer::BenchBeginFrame()
++{
++    if (!m_bench.active)
++        return;
++    auto sun = m_pathtracerScene->GetSunLight();
++    std::vector<std::shared_ptr<engine::Light>> lights;
++    for (auto l : m_pathtracerScene->GetScene()->GetSceneGraph()->GetLights())
++        if (l.get() != (engine::Light*)sun.get()) lights.push_back(l);
++    auto getI = [](const std::shared_ptr<engine::Light>& l) -> float {
++        if (auto p = std::dynamic_pointer_cast<engine::PointLight>(l)) return p->intensity;
++        if (auto s = std::dynamic_pointer_cast<engine::SpotLight>(l)) return s->intensity;
++        return 0.f; };
++    auto setI = [](const std::shared_ptr<engine::Light>& l, float v) {
++        if (auto p = std::dynamic_pointer_cast<engine::PointLight>(l)) p->intensity = v;
++        else if (auto s = std::dynamic_pointer_cast<engine::SpotLight>(l)) s->intensity = v; };
++    if (!m_bench.origSaved)
++    {
++        m_bench.origSun = sun ? sun->irradiance : 0.f;
++        m_bench.origSky = m_ui.skyIntensity;
++        for (auto& l : lights) m_bench.origLights.push_back(getI(l));
++        m_bench.origSaved = true;
++        m_ui.enableVSync = false;
++        std::filesystem::create_directories(m_bench.out);
++        if (m_bench.mode == "run")
++        {
++            for (size_t s = 0; s < m_bench.states.size(); ++s)
++                for (int p = 0; p < std::max(m_bench.poses, 1); ++p)
++                {
++                    std::vector<float> img; int w = 0, h = 0;
++                    if (!BenchConfig::ReadImage(m_bench.refDir.empty() ? m_bench.Path("../ref/" + m_bench.RefName((int)s, p)) : m_bench.refDir + "/" + m_bench.RefName((int)s, p), w, h, img)) img.clear();
++                    if (!img.empty()) { m_bench.refW = w; m_bench.refH = h; }
++                    m_bench.refs.push_back(img);
++                }
++            m_bench.csv = fopen(m_bench.Path("errors.csv").c_str(), "w");
++            m_bench.LoadProbes();
++            if (m_bench.csv)
++            {
++                fprintf(m_bench.csv, "frame,state,rel_rmse,ref_mean,tile_err,bypass,gpu_ms,copy_ms,loss");
++                for (int bit = 0; bit < 8 && !m_bench.probes.empty(); ++bit) fprintf(m_bench.csv, ",p%d_bias,p%d_log", bit, bit);
++                fprintf(m_bench.csv, "\n");
++            }
++        }
++        log::info("Bench : %d lampes ponctuelles/spots, soleil %.2f, ciel %.2f", (int)lights.size(), m_bench.origSun, m_bench.origSky);
++        {   // diagnostic : lampes vues par le banc
++            FILE* inf = fopen(m_bench.Path("bench_info.txt").c_str(), "w");
++            if (inf)
++            {
++                fprintf(inf, "soleil irradiance=%.4f ciel=%.4f lampes=%d\n", m_bench.origSun, m_bench.origSky, (int)lights.size());
++                for (auto& l : lights)
++                {
++                    dm::double3 pos = l->GetPosition();
++                    fprintf(inf, "  %s intensite=%.3f pos=(%.2f, %.2f, %.2f)\n", l->GetName().c_str(), getI(l), pos.x, pos.y, pos.z);
++                }
++                fclose(inf);
++            }
++        }
++        if (m_bench.csv) fprintf(m_bench.csv, "# sharc_entries=%u snapshot_bytes=%llu dep_bytes=%llu\n", m_sharcEntriesNum, (unsigned long long)m_sharcEntriesNum * (8ull + 16ull + 16ull),
++            (unsigned long long)(m_benchDepBuffer ? 2 * m_benchDepBuffer->getDesc().byteSize : 0));
++    }
++    int stateIdx;
++    if (m_bench.warmup > 0) { m_bench.warmup--; stateIdx = m_bench.seq[0]; m_bench.frame = -1; }
++    else
++    {
++        m_bench.frame++;
++        if (m_bench.frame >= (int)m_bench.seq.size())
++        {
++            if (m_bench.csv) { fclose(m_bench.csv); m_bench.csv = nullptr; }
++            m_bench.active = false;
++            glfwSetWindowShouldClose(GetDeviceManager()->GetWindow(), 1);
++            return;
++        }
++        stateIdx = m_bench.seq[m_bench.frame];
++        // ---- evenement signale par le moteur : changement d'etat
++        if (m_bench.frame > 0 && m_bench.seq[m_bench.frame] != m_bench.seq[m_bench.frame - 1])
++        {
++            int prev = m_bench.seq[m_bench.frame - 1];
++            bool restored = false;
++#if ENABLE_SHARC
++            if (m_bench.snapshots && m_ui.techSelection == TechSelection::Sharc && m_sharcHashEntriesBuffer)
++            {
++                if (m_bench.frame - m_benchLastEvent >= 20)   // instantane de l'etat quitte (s'il etait stable)
++                {
++                    SharcSnapshot* slot = nullptr;
++                    for (auto& s : m_benchSnaps) if (s.state == prev) slot = &s;
++                    if (!slot && m_bench.compactSnap) { m_benchSnaps.push_back({}); slot = &m_benchSnaps.back(); }
++                    if (m_bench.compactSnap) { slot->state = prev; BenchSnapSave(*slot); }
++                    else if (!slot)
++                    {
++                        m_benchSnaps.push_back({});
++                        slot = &m_benchSnaps.back();
++                        auto mk = [&](nvrhi::IBuffer* src, const char* nm) { nvrhi::BufferDesc d = src->getDesc(); d.debugName = nm; return GetDevice()->createBuffer(d); };
++                        slot->hash = mk(m_sharcHashEntriesBuffer, "snapHash");
++                        slot->accum = mk(m_sharcAccumulationBuffer, "snapAccum");
++                        slot->resolved = mk(m_sharcResolvedBuffer, "snapResolved");
++                    }
++                    if (!m_bench.compactSnap)
++                    {
++                        slot->state = prev;
++                        BenchCopySharc(slot->hash, slot->accum, slot->resolved, m_sharcHashEntriesBuffer, m_sharcAccumulationBuffer, m_sharcResolvedBuffer);
++                    }
++                }
++                for (auto& s : m_benchSnaps)
++                    if (s.state == stateIdx)   // etat deja vu : restauration instantanee
++                    {
++                        if (m_bench.compactSnap) BenchSnapRestore(s);
++                        else BenchCopySharc(m_sharcHashEntriesBuffer, m_sharcAccumulationBuffer, m_sharcResolvedBuffer, s.hash, s.accum, s.resolved);
++                        restored = true;
++                    }
++            }
++#endif
++            if (m_bench.eventBoost > 0 && !restored)
++                m_benchBoost = m_bench.eventBoost;
++            if (m_bench.eventBypass > 0 && !restored)
++            {
++                m_benchBypass = m_bench.eventBypass;   // contournement : on ne lit plus le cache pendant qu'il se reconstruit
++                m_benchEma.clear(); m_benchBypassAge = 0;
++            }
++#if ENABLE_SHARC
++            // etat nouveau + changement global (toute la scene en depend) : on vide le cache au lieu de laisser recirculer l'ancienne lumiere
++            if (m_bench.eventClear && !restored && m_ui.techSelection == TechSelection::Sharc)
++                m_ui.sharcEnableClear = true;
++#endif
++#if ENABLE_SHARC
++            // invalidation ciblee : seules les entrees qui dependent de ce qui a change sont remises a zero
++            if (m_bench.depInv && !restored && m_ui.techSelection == TechSelection::Sharc)
++            {
++                const BenchState& a = m_bench.states[prev];
++                const BenchState& b = m_bench.states[stateIdx];
++                auto all = m_pathtracerScene->GetScene()->GetSceneGraph()->GetLights();
++                size_t j = 0;
++                for (size_t i = 0; i < all.size() && i < 31; ++i)
++                {
++                    float fa, fb;
++                    if (all[i].get() == (engine::Light*)sun.get()) { fa = a.sun; fb = b.sun; }
++                    else { fa = j < a.lights.size() ? a.lights[j] : 1.f; fb = j < b.lights.size() ? b.lights[j] : 1.f; ++j; }
++                    if (fa != fb) m_benchInv[3] |= 1u << i;
++                }
++                if (a.sky != b.sky) m_benchInv[3] |= 0x80000000u;
++                if (a.obj != b.obj) { BenchObjVoxels(a.obj, m_benchInv); BenchObjVoxels(b.obj, m_benchInv); }
++                m_benchCountBefore = BenchCountValid();   // diagnostic : part du cache effacee
++                m_benchCountAfter = 2;
++            }
++#endif
++            if (m_bench.dlssReset) m_benchDlssReset = true;
++            m_benchLastEvent = m_bench.frame;
++        }
++    }
++#if ENABLE_SHARC
++    static bool clearArmed = false;   // le vidage ne dure qu'une image
++    if (clearArmed) { m_ui.sharcEnableClear = false; clearArmed = false; }
++    if (m_ui.sharcEnableClear && m_bench.eventClear) clearArmed = true;
++#endif
++    if (m_benchCountAfter > 0 && --m_benchCountAfter == 0)
++    {
++        uint32_t after = BenchCountValid();
++        if (!m_benchSnapLog) m_benchSnapLog = fopen(m_bench.Path("snapshots.txt").c_str(), "w");
++        if (m_benchSnapLog) { fprintf(m_benchSnapLog, "invalidation frame=%d valid_before=%u valid_after=%u kept=%.1f%%\n", m_bench.frame, m_benchCountBefore, after, 100.0 * after / std::max(m_benchCountBefore, 1u)); fflush(m_benchSnapLog); }
++    }
++    // ---- arret pilote : une image sur 6 pendant le contournement consulte le cache (image de controle)
++    m_benchCheckFrame = m_bench.bypassAdaptive && m_benchBypass > 0 && m_benchBypassAge >= 5 && (m_benchBypassAge % 6 == 5);
++    // ---- reaction declenchee par l'evenement (rampe), sinon reglages par defaut
++    if (m_benchDefaultSharcAccum < 0) m_benchDefaultSharcAccum = m_ui.sharcAccumulationFrameNum;
++#if ENABLE_NRC
++    if (m_benchDefaultNrcIter < 0) m_benchDefaultNrcIter = m_ui.nrcNumTrainingIterations;
++#endif
++    if (m_benchBoost > 0)
++    {
++        int k = m_bench.eventBoost - m_benchBoost;   // images depuis l'evenement
++        m_ui.sharcAccumulationFrameNum = std::min(m_benchDefaultSharcAccum, 2 + k / 2);
++#if ENABLE_NRC
++        m_ui.nrcNumTrainingIterations = 4;
++#endif
++        m_benchBoost--;
++    }
++    else
++    {
++        m_ui.sharcAccumulationFrameNum = m_benchDefaultSharcAccum;
++#if ENABLE_NRC
++        m_ui.nrcNumTrainingIterations = m_benchDefaultNrcIter;
++#endif
++    }
++    const BenchState& st = m_bench.states[stateIdx];
++    if (!m_bench.objNode.empty() && st.obj != m_benchObjCur && st.obj < (int)m_bench.objPos.size())
++    {
++        if (!m_benchObj)
++            for (engine::SceneGraphWalker w(m_pathtracerScene->GetScene()->GetSceneGraph()->GetRootNode().get()); w; w.Next(true))
++                if (w->GetName() == m_bench.objNode) { m_benchObj = w->shared_from_this(); break; }
++        if (m_benchObj)
++        {
++            auto& p = m_bench.objPos[st.obj];
++            m_benchObj->SetTranslation(dm::double3(p[0], p[1], p[2]));
++            if (p[3] > 0.f) m_benchObj->SetScaling(dm::double3(p[3], p[4], p[5]));
++            m_benchObjCur = st.obj;
++        }
++    }
++    if (m_bench.camPeriod > 0)
++    {
++        if (!m_benchCamSaved) { m_benchCamPos = m_camera.GetPosition(); m_benchCamDir = m_camera.GetDir(); m_benchCamUp = m_camera.GetUp(); m_benchCamSaved = true; }
++        const float a = 2.f * dm::PI_f * m_bench.CamPhase(m_bench.frame);
++        dm::float3 right = dm::normalize(dm::cross(m_benchCamDir, dm::float3(0.f, 1.f, 0.f)));
++        dm::float3 pos = m_benchCamPos + right * (m_bench.camAmp * std::sin(a)) + m_benchCamDir * (0.5f * m_bench.camAmp * (1.f - std::cos(a)));
++        float yaw = m_bench.camYaw * dm::PI_f / 180.f * std::sin(a);
++        dm::float3 dir = m_benchCamDir * std::cos(yaw) + right * std::sin(yaw);
++        m_camera.LookAt(pos, pos + dir);
++    }
++    if (sun) sun->irradiance = m_bench.origSun * st.sun;
++    m_ui.skyIntensity = m_bench.origSky * st.sky;
++    for (size_t i = 0; i < lights.size(); ++i)
++        setI(lights[i], m_bench.origLights[i] * (i < st.lights.size() ? st.lights[i] : 1.f));
++    if (m_bench.mode == "run")
++        m_resetAccumulation = true;                 // pas d'accumulation : pipeline temps reel image par image
++    else if (m_bench.frame <= 0 || m_bench.SegKey(m_bench.frame) != m_bench.SegKey(m_bench.frame - 1))
++        m_resetAccumulation = true;                 // reference : accumulation par etat (et par pose)
++}
++
++void Pathtracer::BenchCopySharc(nvrhi::IBuffer* dh, nvrhi::IBuffer* da, nvrhi::IBuffer* dr, nvrhi::IBuffer* sh, nvrhi::IBuffer* sa, nvrhi::IBuffer* sr)
++{
++    nvrhi::IDevice* device = GetDevice();
++    nvrhi::CommandListHandle cl = device->createCommandList();
++    if (!m_benchCopyTimer) m_benchCopyTimer = device->createTimerQuery();
++    else device->resetTimerQuery(m_benchCopyTimer);
++    cl->open();
++    cl->beginTimerQuery(m_benchCopyTimer);
++    cl->copyBuffer(dh, 0, sh, 0, sh->getDesc().byteSize);
++    cl->copyBuffer(da, 0, sa, 0, sa->getDesc().byteSize);
++    cl->copyBuffer(dr, 0, sr, 0, sr->getDesc().byteSize);
++    cl->endTimerQuery(m_benchCopyTimer);
++    cl->close();
++    device->executeCommandList(cl);
++    device->waitForIdle();
++    m_benchEventMs += device->getTimerQueryTime(m_benchCopyTimer) * 1000.f;
++}
++
++void Pathtracer::BenchSnapDispatch(nvrhi::ICommandList* cl, nvrhi::IComputePipeline* pso, nvrhi::IBindingSet* set, uint32_t threads, uint32_t count)
++{
++    nvrhi::ComputeState cs;
++    cs.pipeline = pso;
++    cs.bindings = { set };
++    cl->setComputeState(cs);
++    uint32_t pc[4] = { m_sharcEntriesNum, count, 0, 0 };
++    cl->setPushConstants(pc, sizeof(pc));
++    cl->dispatch((threads + 255) / 256, 1, 1);
++}
++
++// instantane compact : on compte les entrees valides, on alloue juste ce qu'il faut, on les recopie (24 octets chacune)
++void Pathtracer::BenchSnapSave(SharcSnapshot& s)
++{
++    nvrhi::IDevice* device = GetDevice();
++    if (!m_benchCopyTimer) m_benchCopyTimer = device->createTimerQuery();
++    auto makeSet = [&](nvrhi::IBuffer* rec) {
++        nvrhi::BindingSetDesc d;
++        d.bindings = { nvrhi::BindingSetItem::StructuredBuffer_UAV(0, m_sharcHashEntriesBuffer), nvrhi::BindingSetItem::StructuredBuffer_UAV(3, m_sharcResolvedBuffer),
++                       nvrhi::BindingSetItem::StructuredBuffer_UAV(5, rec), nvrhi::BindingSetItem::StructuredBuffer_UAV(6, m_benchCounter),
++                       nvrhi::BindingSetItem::PushConstants(0, 16) };
++        return device->createBindingSet(d, m_benchSnapLayout); };
++    // 1) comptage
++    float ms = 0.f;
++    {
++        if (!s.rec) { nvrhi::BufferDesc d; d.byteSize = 24; d.structStride = 24; d.canHaveUAVs = true; d.initialState = nvrhi::ResourceStates::UnorderedAccess; d.keepInitialState = true; d.debugName = "snapRec"; s.rec = device->createBuffer(d); }
++        nvrhi::BindingSetHandle tmp = makeSet(s.rec);
++        nvrhi::CommandListHandle cl = device->createCommandList();
++        device->resetTimerQuery(m_benchCopyTimer);
++        cl->open();
++        cl->beginTimerQuery(m_benchCopyTimer);
++        cl->clearBufferUInt(m_benchCounter, 0);
++        BenchSnapDispatch(cl, m_benchSnapCount, tmp, m_sharcEntriesNum, 0);
++        cl->endTimerQuery(m_benchCopyTimer);
++        cl->copyBuffer(m_benchCounterStaging, 0, m_benchCounter, 0, 4);
++        cl->close();
++        device->executeCommandList(cl);
++        device->waitForIdle();
++        ms += device->getTimerQueryTime(m_benchCopyTimer) * 1000.f;
++        const uint32_t* p = (const uint32_t*)device->mapBuffer(m_benchCounterStaging, nvrhi::CpuAccessMode::Read);
++        s.count = p ? *p : 0;
++        device->unmapBuffer(m_benchCounterStaging);
++    }
++    // 2) tampon a la bonne taille, recopie
++    {
++        nvrhi::BufferDesc d; d.byteSize = (uint64_t)std::max(s.count, 1u) * 24; d.structStride = 24; d.canHaveUAVs = true;
++        d.initialState = nvrhi::ResourceStates::UnorderedAccess; d.keepInitialState = true; d.debugName = "snapRec";
++        s.rec = device->createBuffer(d);
++        s.recSet = makeSet(s.rec);
++        nvrhi::CommandListHandle cl = device->createCommandList();
++        device->resetTimerQuery(m_benchCopyTimer);
++        cl->open();
++        cl->beginTimerQuery(m_benchCopyTimer);
++        cl->clearBufferUInt(m_benchCounter, 0);
++        BenchSnapDispatch(cl, m_benchSnapPack, s.recSet, m_sharcEntriesNum, s.count);
++        cl->endTimerQuery(m_benchCopyTimer);
++        cl->close();
++        device->executeCommandList(cl);
++        device->waitForIdle();
++        ms += device->getTimerQueryTime(m_benchCopyTimer) * 1000.f;
++    }
++    m_benchEventMs += ms;
++    if (!m_benchSnapLog) m_benchSnapLog = fopen(m_bench.Path("snapshots.txt").c_str(), "w");
++    if (m_benchSnapLog) { fprintf(m_benchSnapLog, "save frame=%d state=%d entries=%u bytes=%llu gpu_ms=%.3f\n", m_bench.frame, s.state, s.count, (unsigned long long)s.count * 24ull, ms); fflush(m_benchSnapLog); }
++}
++
++uint32_t Pathtracer::BenchCountValid()
++{
++    nvrhi::IDevice* device = GetDevice();
++    nvrhi::BufferDesc d; d.byteSize = 24; d.structStride = 24; d.canHaveUAVs = true; d.initialState = nvrhi::ResourceStates::UnorderedAccess; d.keepInitialState = true;
++    static nvrhi::BufferHandle dummy; if (!dummy) dummy = device->createBuffer(d);
++    nvrhi::BindingSetDesc sd;
++    sd.bindings = { nvrhi::BindingSetItem::StructuredBuffer_UAV(0, m_sharcHashEntriesBuffer), nvrhi::BindingSetItem::StructuredBuffer_UAV(3, m_sharcResolvedBuffer),
++                    nvrhi::BindingSetItem::StructuredBuffer_UAV(5, dummy), nvrhi::BindingSetItem::StructuredBuffer_UAV(6, m_benchCounter), nvrhi::BindingSetItem::PushConstants(0, 16) };
++    nvrhi::BindingSetHandle set = device->createBindingSet(sd, m_benchSnapLayout);
++    nvrhi::CommandListHandle cl = device->createCommandList();
++    cl->open();
++    cl->clearBufferUInt(m_benchCounter, 0);
++    BenchSnapDispatch(cl, m_benchSnapCount, set, m_sharcEntriesNum, 0);
++    cl->copyBuffer(m_benchCounterStaging, 0, m_benchCounter, 0, 4);
++    cl->close();
++    device->executeCommandList(cl);
++    device->waitForIdle();
++    const uint32_t* p = (const uint32_t*)device->mapBuffer(m_benchCounterStaging, nvrhi::CpuAccessMode::Read);
++    uint32_t n = p ? *p : 0;
++    device->unmapBuffer(m_benchCounterStaging);
++    return n;
++}
++
++void Pathtracer::BenchSnapRestore(SharcSnapshot& s)
++{
++    nvrhi::IDevice* device = GetDevice();
++    if (!m_benchCopyTimer) m_benchCopyTimer = device->createTimerQuery();
++    nvrhi::CommandListHandle cl = device->createCommandList();
++    device->resetTimerQuery(m_benchCopyTimer);
++    cl->open();
++    cl->beginTimerQuery(m_benchCopyTimer);
++    cl->clearBufferUInt(m_sharcHashEntriesBuffer, m_sharcInvalidEntry);
++    cl->clearBufferUInt(m_sharcAccumulationBuffer, 0);
++    cl->clearBufferUInt(m_sharcResolvedBuffer, 0);
++    cl->clearBufferUInt(m_benchDepBuffer, 0);   // les masques se reconstruisent des les images suivantes
++    cl->clearBufferUInt(m_benchDepBuffer1, 0);
++    if (s.count) BenchSnapDispatch(cl, m_benchSnapRestore, s.recSet, s.count, s.count);
++    cl->endTimerQuery(m_benchCopyTimer);
++    cl->close();
++    device->executeCommandList(cl);
++    device->waitForIdle();
++    float ms = device->getTimerQueryTime(m_benchCopyTimer) * 1000.f;
++    m_benchEventMs += ms;
++    if (!m_benchSnapLog) m_benchSnapLog = fopen(m_bench.Path("snapshots.txt").c_str(), "w");
++    if (m_benchSnapLog) { fprintf(m_benchSnapLog, "restore frame=%d state=%d entries=%u gpu_ms=%.3f\n", m_bench.frame, s.state, s.count, ms); fflush(m_benchSnapLog); }
++}
++
++// zones de dependance touchees par la boite englobante de l'objet (avec une marge)
++void Pathtracer::BenchObjVoxels(int obj, uint32_t inv[4])
++{
++    if (obj < 0 || obj >= (int)m_bench.objPos.size()) return;
++    const int G[3] = { 6, 4, 4 };
++    const float margin = 0.25f;
++    float lo[3], hi[3];
++    for (int k = 0; k < 3; ++k)
++    {
++        float half = m_bench.objPos[obj][3] > 0.f ? 0.5f * m_bench.objPos[obj][3 + k] : m_bench.objHalf[k];
++        lo[k] = m_bench.objPos[obj][k] - half - margin; hi[k] = m_bench.objPos[obj][k] + half + margin;
++    }
++    for (int z = 0; z < G[2]; ++z) for (int y = 0; y < G[1]; ++y) for (int x = 0; x < G[0]; ++x)
++    {
++        int v[3] = { x, y, z };
++        bool overlap = true;
++        for (int k = 0; k < 3; ++k)
++        {
++            float cs = (m_bench.gridMax[k] - m_bench.gridMin[k]) / G[k];
++            float c0 = m_bench.gridMin[k] + cs * v[k], c1 = c0 + cs;
++            if (hi[k] < c0 || lo[k] > c1) overlap = false;
++        }
++        if (overlap) { int b = x + G[0] * (y + G[1] * z); inv[b / 32] |= 1u << (b % 32); }
++    }
++}
++
++bool Pathtracer::BenchReadback(std::vector<float>& rgb, int& w, int& h)
++{
++    nvrhi::IDevice* device = GetDevice();
++    // accumulation : image dans le tampon d'accumulation ; NRD : image debruitee dans outPathTracer
++    const bool dlssOn = m_ui.dlssSupported && m_ui.dlssMode != DlssMode::None;   // DLSS : image de sortie dans le tampon d'accumulation
++    nvrhi::TextureHandle src = (m_ui.denoiserType == DenoiserType::Accumulation || dlssOn) ? m_accumulationBuffer : m_renderTargets->outPathTracer;
++    if (!src)
++        return false;
++    const nvrhi::TextureDesc& d = src->getDesc();
++    if (!m_benchStaging || m_benchStaging->getDesc().width != d.width || m_benchStaging->getDesc().height != d.height)
++    {
++        nvrhi::TextureDesc sd = d;
++        sd.isUAV = false; sd.isRenderTarget = false;
++        sd.initialState = nvrhi::ResourceStates::CopyDest; sd.keepInitialState = true;
++        sd.debugName = "BenchStaging";
++        m_benchStaging = device->createStagingTexture(sd, nvrhi::CpuAccessMode::Read);
++    }
++    nvrhi::CommandListHandle cl = device->createCommandList();
++    cl->open();
++    cl->copyTexture(m_benchStaging, nvrhi::TextureSlice(), src, nvrhi::TextureSlice());
++    cl->close();
++    device->executeCommandList(cl);
++    device->waitForIdle();
++    size_t pitch = 0;
++    const uint8_t* p = (const uint8_t*)device->mapStagingTexture(m_benchStaging, nvrhi::TextureSlice(), nvrhi::CpuAccessMode::Read, &pitch);
++    if (!p)
++        return false;
++    w = (int)d.width; h = (int)d.height;
++    rgb.resize((size_t)w * h * 3);
++    for (int y = 0; y < h; ++y)
++    {
++        const float* row = (const float*)(p + (size_t)y * pitch);
++        for (int x = 0; x < w; ++x) for (int k = 0; k < 3; ++k) rgb[3 * ((size_t)y * w + x) + k] = row[4 * x + k];
++    }
++    device->unmapStagingTexture(m_benchStaging);
++    return true;
++}
++
++void Pathtracer::BenchEndFrame()
++{
++    const int wasBypass = m_benchCheckFrame ? 2 : (m_benchBypass > 0 ? 1 : 0);
++    const bool wasCheck = m_benchCheckFrame;
++    if (m_benchBypass > 0)
++    {
++        m_benchBypass--;
++        m_benchBypassAge++;
++        if (m_benchBypass == 0) { m_benchEma.clear(); m_benchBypassAge = 0; }
++    }
++    if (!m_bench.active || m_bench.frame < 0)
++        return;
++    int f = m_bench.frame;
++    bool lastOfSegment = (f + 1 >= (int)m_bench.seq.size()) || m_bench.SegKey(f + 1) != m_bench.SegKey(f);
++    const int pose = m_bench.RefPose(f);
++    bool wanted = (m_bench.mode == "ref") ? lastOfSegment : (pose >= 0);
++    for (int cf : m_bench.captures) if (cf == f) wanted = true;
++    if (!wanted && m_bench.poses > 0)
++    {   // camera mobile : pas de reference pour cette image, on ne garde que le temps GPU
++        if (m_bench.csv)
++        {
++            float gpuMs = -1.f;
++            if (m_benchTimer && GetDevice()->pollTimerQuery(m_benchTimer)) gpuMs = GetDevice()->getTimerQueryTime(m_benchTimer) * 1000.f;
++            fprintf(m_bench.csv, "%d,%d,-1,-1,-1,%d,%.4f,%.4f,0", f, m_bench.seq[f], wasBypass, gpuMs, m_benchEventMs);
++            for (int bit = 0; bit < 8 && !m_bench.probes.empty(); ++bit) fprintf(m_bench.csv, ",0,0");
++            fprintf(m_bench.csv, "\n");
++            m_benchEventMs = 0.f;
++        }
++        return;
++    }
++    bool isRef = m_bench.mode == "ref";
++    if (isRef && !lastOfSegment)
++        return;
++    std::vector<float> rgb; int w = 0, h = 0;
++    if (!BenchReadback(rgb, w, h))
++        return;
++    int s = m_bench.seq[f];
++    if (!isRef && m_bench.bypassAdaptive && (wasBypass > 0))
++    {
++        // luminosite : image entiere + grille 8x4
++        std::vector<double> v(33, 0.0); std::vector<double> cnt(33, 0.0);
++        for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x)
++        {
++            size_t p = (size_t)y * w + x; double l = rgb[3 * p] + rgb[3 * p + 1] + rgb[3 * p + 2];
++            int t = 1 + (y * 4 / h) * 8 + (x * 8 / w);
++            v[0] += l; cnt[0] += 1; v[t] += l; cnt[t] += 1;
++        }
++        for (int t = 0; t < 33; ++t) v[t] /= std::max(cnt[t], 1.0);
++        if (!wasCheck)
++        {
++            if (m_benchEma.empty()) m_benchEma = v;
++            else for (int t = 0; t < 33; ++t) m_benchEma[t] = 0.7 * m_benchEma[t] + 0.3 * v[t];
++        }
++        else if (!m_benchEma.empty())
++        {
++            double dImg = std::abs(v[0] / std::max(m_benchEma[0], 1e-9) - 1.0);
++            std::vector<double> dt;
++            for (int t = 1; t < 33; ++t) if (m_benchEma[t] > 0.05 * m_benchEma[0]) dt.push_back(std::abs(v[t] / m_benchEma[t] - 1.0));
++            std::sort(dt.begin(), dt.end());
++            double d90 = dt.empty() ? 0.0 : dt[(size_t)(0.9 * (dt.size() - 1))];
++            if (dImg < 0.03 && d90 < 0.06) { m_benchBypass = 0; m_benchEma.clear(); m_benchBypassAge = 0; }   // le cache a rattrape
++        }
++    }
++    if (isRef)
++    {
++        BenchConfig::WriteImage(m_bench.Path(m_bench.RefName(s, pose)), w, h, rgb);
++        log::info("Bench : reference etat %d enregistree (%dx%d)", s, w, h);
++        return;
++    }
++    double mean = 0, e = -1, te = -1;
++    const int ri = s * std::max(m_bench.poses, 1) + std::max(pose, 0);
++    if (pose >= 0 && ri < (int)m_bench.refs.size() && !m_bench.refs[ri].empty() && m_bench.refW == w && m_bench.refH == h)
++    {
++        e = BenchConfig::RelRmse(rgb, m_bench.refs[ri], &mean);
++        te = BenchConfig::TileRelErr(rgb, m_bench.refs[ri], w, h);
++    }
++    if (m_bench.csv)
++    {
++        float gpuMs = -1.f;
++        if (m_benchTimer && GetDevice()->pollTimerQuery(m_benchTimer)) gpuMs = GetDevice()->getTimerQueryTime(m_benchTimer) * 1000.f;
++        fprintf(m_bench.csv, "%d,%d,%.6f,%.6f,%.6f,%d,%.4f,%.4f,%.6g", f, s, e, mean, te, wasBypass, gpuMs, m_benchEventMs, m_benchLoss);
++        m_benchEventMs = 0.f;
++        bool okp = !m_bench.probes.empty() && m_bench.probeW == w && m_bench.probeH == h && e >= 0;
++        for (int bit = 0; bit < 8 && !m_bench.probes.empty(); ++bit)
++        {
++            double bias = 0, lg = 0;
++            if (okp) m_bench.ProbeMetrics(rgb, m_bench.refs[ri], w, h, bit, bias, lg, std::max(pose, 0));
++            fprintf(m_bench.csv, ",%.4f,%.5f", bias, lg);
++        }
++        fprintf(m_bench.csv, "\n");
++        fflush(m_bench.csv);
++    }
++    for (int cf : m_bench.captures)
++        if (cf == f) BenchConfig::WriteImage(m_bench.Path("frame_" + std::to_string(f) + ".bin"), w, h, rgb);
+ }
+ 
+ std::shared_ptr<donut::engine::ShaderFactory> Pathtracer::GetShaderFactory()
+diff --git a/Samples/Pathtracer/Pathtracer.h b/Samples/Pathtracer/Pathtracer.h
+index 1e82198..6c2cccb 100644
+--- a/Samples/Pathtracer/Pathtracer.h
++++ b/Samples/Pathtracer/Pathtracer.h
+@@ -10,6 +10,7 @@
+ 
+ #pragma once
+ 
++#include "Bench.h"
+ #include <donut/app/ApplicationBase.h>
+ #include <donut/app/Camera.h>
+ #include <donut/core/vfs/VFS.h>
+@@ -123,6 +124,43 @@ private:
+     bool m_resetAccumulation;
+     uint32_t m_accumulatedFrameCount;
+ 
++    // banc d'essai automatique (-bench)
++    BenchConfig m_bench;
++    nvrhi::StagingTextureHandle m_benchStaging;
++    void BenchBeginFrame();
++    void BenchEndFrame();
++    bool BenchReadback(std::vector<float>& rgb, int& w, int& h);
++    struct SharcSnapshot { int state = -1; nvrhi::BufferHandle hash, accum, resolved, rec; nvrhi::BindingSetHandle recSet; uint32_t count = 0; };
++    nvrhi::BufferHandle m_benchDepBuffer, m_benchDepBuffer1, m_benchCounter, m_benchCounterStaging;
++    uint32_t m_benchDepFrame = 0, m_benchDepBank = 0;
++    bool m_benchDlssReset = false;
++    nvrhi::BindingLayoutHandle m_benchSnapLayout;
++    nvrhi::ComputePipelineHandle m_benchSnapCount, m_benchSnapPack, m_benchSnapRestore;
++    uint32_t m_benchInv[4] = { 0, 0, 0, 0 };
++    std::shared_ptr<donut::engine::SceneGraphNode> m_benchObj;
++    int m_benchObjCur = -1;
++    bool m_benchCamSaved = false;
++    dm::float3 m_benchCamPos, m_benchCamDir, m_benchCamUp;
++    FILE* m_benchSnapLog = nullptr;
++    void BenchSnapSave(SharcSnapshot& s);
++    void BenchSnapRestore(SharcSnapshot& s);
++    void BenchSnapDispatch(nvrhi::ICommandList* cl, nvrhi::IComputePipeline* pso, nvrhi::IBindingSet* set, uint32_t threads, uint32_t count);
++    void BenchObjVoxels(int obj, uint32_t inv[4]);
++    uint32_t BenchCountValid();
++    int m_benchCountAfter = 0;
++    uint32_t m_benchCountBefore = 0;
++    std::vector<SharcSnapshot> m_benchSnaps;
++    int m_benchBoost = 0, m_benchLastEvent = 0, m_benchDefaultSharcAccum = -1, m_benchDefaultNrcIter = -1;
++    int m_benchBypass = 0;
++    nvrhi::TimerQueryHandle m_benchTimer, m_benchCopyTimer;
++    float m_benchEventMs = 0.f;   // cout GPU des copies d'instantanes de l'image courante
++    float m_benchLoss = 0.f;
++    std::vector<float> m_benchLossHist;
++    int m_benchBypassAge = 0;
++    bool m_benchCheckFrame = false;
++    std::vector<double> m_benchEma;   // luminosite moyenne des images en path tracing complet (image + 8x4 tuiles)
++    void BenchCopySharc(nvrhi::IBuffer* dh, nvrhi::IBuffer* da, nvrhi::IBuffer* dr, nvrhi::IBuffer* sh, nvrhi::IBuffer* sa, nvrhi::IBuffer* sr);
++
+     nvrhi::GraphicsAPI m_api;
+ 
+     float m_renderScale = 1.0f;
+diff --git a/Samples/Pathtracer/Pathtracer.hlsl b/Samples/Pathtracer/Pathtracer.hlsl
+index 5deb51c..6412a8b 100644
+--- a/Samples/Pathtracer/Pathtracer.hlsl
++++ b/Samples/Pathtracer/Pathtracer.hlsl
+@@ -137,10 +137,78 @@ float3 CastShadowRay(float3 hitPosition, float3 surfaceNormal, float3 directionT
+     return payload.visibility;
+ }
+ 
++// ---- banc : masque de dependances par entree SHaRC
++// 96 bits de zones (grille 6 x 4 x 4 dans la boite benchGridMin..Max) + 32 bits de lampes (bit 31 = ciel)
++#define DEP_GX 6
++#define DEP_GY 4
++#define DEP_GZ 4
++#if SHARC_UPDATE
++RWStructuredBuffer<uint4>                   u_BenchDep                      : register(u4, space3);   // banque 0
++RWStructuredBuffer<uint4>                   u_BenchDep1                     : register(u7, space3);   // banque 1
++
++void DepMarkPoint(inout uint3 m, float3 p)
++{
++    float3 c = (p - g_Global.benchGridMin.xyz) / (g_Global.benchGridMax.xyz - g_Global.benchGridMin.xyz) * float3(DEP_GX, DEP_GY, DEP_GZ);
++    if (any(c < 0.0f) || any(c >= float3(DEP_GX, DEP_GY, DEP_GZ)))
++        return;
++    uint3 v = uint3(c);
++    uint b = v.x + DEP_GX * (v.y + DEP_GY * v.z);
++    uint bit = 1u << (b & 31u);
++    if (b < 32u) m.x |= bit;
++    else if (b < 64u) m.y |= bit;
++    else m.z |= bit;
++}
++
++// zones traversees par le segment a -> b (decoupe a la boite, pas d'un demi-cote de zone)
++void DepMarkSegment(inout uint3 m, float3 a, float3 b)
++{
++    float3 lo = g_Global.benchGridMin.xyz;
++    float3 hi = g_Global.benchGridMax.xyz;
++    float3 d = b - a;
++    float3 sd = float3(abs(d.x) > 1e-7f ? d.x : 1e-7f, abs(d.y) > 1e-7f ? d.y : 1e-7f, abs(d.z) > 1e-7f ? d.z : 1e-7f);
++    float3 t0 = (lo - a) / sd;
++    float3 t1 = (hi - a) / sd;
++    float3 tn = min(t0, t1);
++    float3 tf = max(t0, t1);
++    float tmin = max(max(tn.x, tn.y), max(tn.z, 0.0f));
++    float tmax = min(min(tf.x, tf.y), min(tf.z, 1.0f));
++    if (tmin > tmax)
++        return;
++    float3 cell = (hi - lo) / float3(DEP_GX, DEP_GY, DEP_GZ);
++    float len = length(d) * (tmax - tmin);
++    uint n = min(uint(ceil(len / (0.5f * min(cell.x, min(cell.y, cell.z))))) + 1u, 48u);
++    for (uint i = 0; i <= n; ++i)
++        DepMarkPoint(m, a + d * lerp(tmin, tmax, float(i) / float(n)) );
++}
++
++void DepOr(uint idx, uint4 m)
++{
++    if (idx == HASH_GRID_INVALID_CACHE_INDEX || all(m == 0))
++        return;
++    if (g_Global.benchDepBank == 0)
++    {
++        uint4 miss = m & ~u_BenchDep[idx];
++        if (miss.x != 0) InterlockedOr(u_BenchDep[idx].x, miss.x);
++        if (miss.y != 0) InterlockedOr(u_BenchDep[idx].y, miss.y);
++        if (miss.z != 0) InterlockedOr(u_BenchDep[idx].z, miss.z);
++        if (miss.w != 0) InterlockedOr(u_BenchDep[idx].w, miss.w);
++    }
++    else
++    {
++        uint4 miss = m & ~u_BenchDep1[idx];
++        if (miss.x != 0) InterlockedOr(u_BenchDep1[idx].x, miss.x);
++        if (miss.y != 0) InterlockedOr(u_BenchDep1[idx].y, miss.y);
++        if (miss.z != 0) InterlockedOr(u_BenchDep1[idx].z, miss.z);
++        if (miss.w != 0) InterlockedOr(u_BenchDep1[idx].w, miss.w);
++    }
++}
++#endif // SHARC_UPDATE
++
+ // Samples a random light from the pool of all lights using RIS (Resampled Importance Sampling)
+-bool SampleLightRIS(inout uint rngState, float3 hitPosition, float3 surfaceNormal, inout LightConstants selectedSample, out float lightSampleWeight)
++bool SampleLightRIS(inout uint rngState, float3 hitPosition, float3 surfaceNormal, inout LightConstants selectedSample, out float lightSampleWeight, out uint selectedIndex)
+ {
+     lightSampleWeight = 1.0f;
++    selectedIndex = 0;
+     if (g_Lighting.lightCount == 0)
+         return false;
+ 
+@@ -180,6 +248,7 @@ bool SampleLightRIS(inout uint rngState, float3 hitPosition, float3 surfaceNorma
+             if (Rand(rngState) < (candidateRISWeight / totalWeights))
+             {
+                 selectedSample = candidate;
++                selectedIndex = randomLightIndex;
+                 samplePdfG = candidatePdfG;
+             }
+         }
+@@ -471,6 +540,16 @@ void PathTraceRays()
+             {
+                 float3 skyValue = g_Lighting.skyColor.rgb;
+ 
++#if SHARC_UPDATE
++                if (g_Global.benchDepEnable)
++                {
++                    uint3 sm = uint3(0, 0, 0);
++                    DepMarkSegment(sm, ray.Origin, ray.Origin + ray.Direction * TRACING_DISTANCE);
++                    uint4 dm = uint4(sm, 0x80000000u);
++                    for (uint di = 0; di < sharcState.pathLength; ++di)
++                        DepOr(sharcState.cacheIndices[di], dm);
++                }
++#endif // SHARC_UPDATE
+                 SharcUpdateMiss(sharcParameters, sharcState, skyValue);
+ 
+                 NrcUpdateOnMiss(nrcPathState);
+@@ -511,6 +590,18 @@ void PathTraceRays()
+ 
+             float3 hitPosition = ray.Origin + ray.Direction * payload.hitDistance;
+ 
++#if SHARC_UPDATE
++            // dependances : segment entrant (pour les sommets precedents), point touche, rayon d'ombre et lampe (pour ce sommet)
++            uint3 depIn = uint3(0, 0, 0);
++            uint3 depLocal = uint3(0, 0, 0);
++            uint depLights = 0;
++            if (g_Global.benchDepEnable)
++            {
++                DepMarkSegment(depIn, ray.Origin, hitPosition);
++                DepMarkPoint(depLocal, hitPosition);
++            }
++#endif // SHARC_UPDATE
++
+             // Construct NRCSurfaceData structure needed for creating a query point at this hit location
+             NrcSurfaceAttributes surfaceAttributes = (NrcSurfaceAttributes)0;
+             surfaceAttributes.encodedPosition = NrcEncodePosition(hitPosition, g_Lighting.nrcConstants);
+@@ -521,7 +612,11 @@ void PathTraceRays()
+             surfaceAttributes.viewVector = viewVector;
+             surfaceAttributes.isDeltaLobe = (material.metalness == 1.0f && material.roughness == 0.0f); // Set to true for perfectly smooth surfaces
+ 
+-            NrcProgressState nrcProgressState = NrcUpdateOnHit(nrcContext, nrcPathState, surfaceAttributes, payload.hitDistance, bounce, throughput, sampleRadiance);
++            // banc : contournement partiel -> aucune requete NRC avant le rebond K (benchBypassCache = K)
++            NrcContext nrcCtxBench = nrcContext;
++            if (g_Global.benchBypassCache > 0.5f && float(bounce) < g_Global.benchBypassCache)
++                nrcCtxBench.constants.terminationHeuristicThreshold = 1e30f;
++            NrcProgressState nrcProgressState = NrcUpdateOnHit(nrcCtxBench, nrcPathState, surfaceAttributes, payload.hitDistance, bounce, throughput, sampleRadiance);
+             if (nrcProgressState == NrcProgressState::TerminateImmediately)
+                 break;
+ 
+@@ -557,7 +652,7 @@ void PathTraceRays()
+                 isValidHit &= footprint > voxelSize;
+ 
+                 float3 sharcRadiance;
+-                if (isValidHit && SharcGetCachedRadiance(sharcParameters, sharcHitData, sharcRadiance, false))
++                if (isValidHit && g_Global.benchBypassCache < 0.5f && SharcGetCachedRadiance(sharcParameters, sharcHitData, sharcRadiance, false))
+                 {
+                     sampleRadiance += sharcRadiance * throughput;
+ 
+@@ -585,8 +680,9 @@ void PathTraceRays()
+                 // Evaluate direct light (next event estimation), start by sampling one light 
+                 LightConstants light;
+                 float lightWeight;
++                uint lightIndex;
+ 
+-                if (SampleLightRIS(rngState, hitPosition, geometryNormal, light, lightWeight))
++                if (SampleLightRIS(rngState, hitPosition, geometryNormal, light, lightWeight, lightIndex))
+                 {
+                     // Prepare data needed to evaluate the light
+                     float3 incidentVector;
+@@ -598,6 +694,14 @@ void PathTraceRays()
+ 
+                     // Cast shadow ray towards the selected light
+                     float3 lightVisibility = CastShadowRay(hitPosition, geometryNormal, vectorToLight, lightDistance);
++#if SHARC_UPDATE
++                    if (g_Global.benchDepEnable)
++                    {
++                        DepMarkSegment(depLocal, hitPosition, hitPosition + vectorToLight * min(lightDistance, TRACING_DISTANCE));
++                        if (any(lightVisibility > 0.0f))
++                            depLights |= 1u << min(lightIndex, 30u);
++                    }
++#endif // SHARC_UPDATE
+                     if (any(lightVisibility > 0.0f))
+                     {
+                         // If light is not in shadow, evaluate BRDF and accumulate its contribution into radiance
+@@ -625,7 +729,25 @@ void PathTraceRays()
+             if (nrcProgressState == NrcProgressState::TerminateAfterDirectLighting)
+                 break;
+ 
+-            if (!SharcUpdateHit(sharcParameters, sharcState, sharcHitData, sampleRadiance, Rand(rngState)))
++#if SHARC_UPDATE
++            const uint depPrevLen = sharcState.pathLength;
++#endif // SHARC_UPDATE
++            const bool sharcContinue = SharcUpdateHit(sharcParameters, sharcState, sharcHitData, sampleRadiance, Rand(rngState));
++#if SHARC_UPDATE
++            if (g_Global.benchDepEnable)
++            {
++                // les sommets precedents recoivent la lumiere de ce sommet : ils heritent de ses dependances
++                uint4 depCur = uint4(depLocal, depLights);
++                uint4 depPrev = depCur | uint4(depIn, 0);
++                uint idx0 = sharcState.cacheIndices[0];
++                if (!sharcContinue && idx0 != HASH_GRID_INVALID_CACHE_INDEX)
++                    depPrev |= u_BenchDep[idx0] | u_BenchDep1[idx0];   // lumiere relue dans le cache : ses dependances suivent
++                DepOr(idx0, depCur);
++                for (uint di = 1; di <= depPrevLen; ++di)
++                    DepOr(sharcState.cacheIndices[di], depPrev);
++            }
++#endif // SHARC_UPDATE
++            if (!sharcContinue)
+                 break;
+ 
+             // Russian roulette
+diff --git a/Samples/Pathtracer/SharcResolve.hlsl b/Samples/Pathtracer/SharcResolve.hlsl
+index 0e6df91..df63b8d 100644
+--- a/Samples/Pathtracer/SharcResolve.hlsl
++++ b/Samples/Pathtracer/SharcResolve.hlsl
+@@ -21,6 +21,8 @@ ConstantBuffer<GlobalConstants>             g_Global                    : regist
+ RWStructuredBuffer<uint64_t>                u_SharcHashEntriesBuffer    : register(u0, space3);
+ RWStructuredBuffer<SharcAccumulationData>   u_SharcAccumulationBuffer   : register(u2, space3);
+ RWStructuredBuffer<SharcPackedData>         u_SharcResolvedBuffer       : register(u3, space3);
++RWStructuredBuffer<uint4>                   u_BenchDep                  : register(u4, space3);
++RWStructuredBuffer<uint4>                   u_BenchDep1                 : register(u7, space3);
+ 
+ [numthreads(LINEAR_BLOCK_SIZE, 1, 1)]
+ void sharcResolve(in uint2 did : SV_DispatchThreadID)
+@@ -45,5 +47,27 @@ void sharcResolve(in uint2 did : SV_DispatchThreadID)
+     resolveParameters.cameraPositionPrev = g_Lighting.sharcCameraPositionPrev.xyz;
+     resolveParameters.frameIndex = g_Global.frameIndex;
+ 
++    // banc : invalidation ciblee -> les entrees qui dependent de ce qui a change repartent de zero
++    const bool depOn = g_Global.benchDepEnable != 0 && did.x < g_Lighting.sharcEntriesNum;
++    // dependances des 16 a 32 dernieres images ; une entree sans masque connu est invalidee par prudence
++    const uint4 dep = depOn ? (u_BenchDep[did.x] | u_BenchDep1[did.x]) : uint4(0, 0, 0, 0);
++    if (depOn && any(g_Global.benchInvMask != 0) && (all(dep == 0) || any((dep & g_Global.benchInvMask) != 0)))
++    {
++        SharcPackedData zeroPacked;
++        zeroPacked.radianceData = float16_t4(0, 0, 0, 0);
++        zeroPacked.sampleData = 0;
++        zeroPacked.sampleDataExt = 0;
++        SharcAccumulationData zeroAccum;
++        zeroAccum.data = uint4(0, 0, 0, 0);
++        u_SharcResolvedBuffer[did.x] = zeroPacked;
++        u_SharcAccumulationBuffer[did.x] = zeroAccum;   // echantillons de cette image possiblement contamines par l'ancien cache
++    }
++
+     SharcResolveEntry(did.x, sharcParameters, resolveParameters);
++
++    if (depOn && u_SharcHashEntriesBuffer[did.x] == HASH_GRID_INVALID_HASH_KEY)
++    {
++        u_BenchDep[did.x] = uint4(0, 0, 0, 0);   // entree evincee : son masque repart a zero
++        u_BenchDep1[did.x] = uint4(0, 0, 0, 0);
++    }
+ }
+\ No newline at end of file
+diff --git a/Samples/Pathtracer/shaders.cfg b/Samples/Pathtracer/shaders.cfg
+index 9571940..008ddfa 100644
+--- a/Samples/Pathtracer/shaders.cfg
++++ b/Samples/Pathtracer/shaders.cfg
+@@ -4,6 +4,9 @@ Pathtracer.hlsl -T lib -D NRC_QUERY=1 -D ENABLE_NRD={0,1} --compilerOptionsDXIL=
+ Pathtracer.hlsl -T lib -D SHARC_UPDATE=1 --compilerOptionsDXIL="-enable-payload-qualifiers"
+ Pathtracer.hlsl -T lib -D SHARC_QUERY=1 -D ENABLE_NRD={0,1} --compilerOptionsDXIL="-enable-payload-qualifiers"
+ SharcResolve.hlsl -T cs -E sharcResolve
++BenchSnap.hlsl -T cs -E snapCount
++BenchSnap.hlsl -T cs -E snapPack
++BenchSnap.hlsl -T cs -E snapRestore
+ Tonemapping.hlsl -T ps -E main_ps
+ Denoiser.hlsl -T cs -E reblurPackData -D NRD_NORMAL_ENCODING=2 -D NRD_ROUGHNESS_ENCODING=1
+ Denoiser.hlsl -T cs -E reblurPackData -D NRD_NORMAL_ENCODING=2 -D NRD_ROUGHNESS_ENCODING=1 -D ENABLE_NRC=1
+diff --git a/Samples/Pathtracer/Bench.h b/Samples/Pathtracer/Bench.h
+new file mode 100644
+index 0000000..10c55b2
+--- /dev/null
++++ b/Samples/Pathtracer/Bench.h
+@@ -0,0 +1,210 @@
++// Banc d'essai automatique (ajoute pour la recherche "cache a dependances") :
++//   Pathtracer.exe -bench <fichier.txt>
++// Fichier : lignes "cle valeurs"
++//   mode ref|run            ref : accumule refframes images par etat et enregistre ref_<k>.bin
++//                           run : deroule la timeline, mesure l'erreur de chaque image contre ref_<etat>.bin
++//   tech none|sharc|nrc
++//   spp <n>                 echantillons par pixel et par image
++//   out <dossier>
++//   warmup <n>              images de chauffe avant le debut (etat de la 1re etape)
++//   state <soleil> <ciel> <lampe0> <lampe1> ...   facteurs d'intensite (1 = valeur de la scene)
++//   refframes <n>
++//   timeline <etat>:<images>,<etat>:<images>,...
++//   capture <image>,<image>,...      images a enregistrer en entier (run)
++#pragma once
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <array>
++#include <fstream>
++#include <sstream>
++#include <string>
++#include <vector>
++
++struct BenchState { float sun = 1.f, sky = 1.f; std::vector<float> lights; int obj = 0; };
++
++struct BenchConfig
++{
++    bool active = false;
++    std::string mode = "run", tech = "none", out = ".", denoiser = "accum";
++    int spp = 1, warmup = 60, refFrames = 256, sharcAccum = -1;
++    float nrcMaxRad = -1.f;
++    int snapshots = 0, eventBoost = 0, eventClear = 0, eventBypass = 0, bypassBounces = 0, bypassAdaptive = 0;
++    int depInv = 0, compactSnap = 0, depReset = 0, dlssReset = 0;
++    std::string dlss = "none";   // none | perf | balanced | quality | dlaa
++    std::string refDir;          // dossier des references ; vide = <out>/../ref
++    float gridMin[3] = { -20.f, -0.5f, 8.f }, gridMax[3] = { -4.f, 7.5f, 24.f };
++    std::string objNode;                                 // objet mobile : nom du noeud, positions, demi-taille
++    std::vector<std::array<float, 6>> objPos;   // position, et taille optionnelle (-1 = celle de la scene)
++    float objHalf[3] = { 0.f, 0.f, 0.f };
++    float camAmp = 0.f, camYaw = 0.f; int camPeriod = 0, poses = 0;   // camera mobile, references par pose
++    std::vector<int> seqPose;
++    std::string probesPath;
++    std::vector<uint8_t> probes;
++    int probeW = 0, probeH = 0;   // briques : instantanes par etat, reaction declenchee par l'evenement
++    std::vector<BenchState> states;
++    std::vector<int> seq, captures;
++
++    // execution
++    int frame = -1;
++    bool origSaved = false;
++    float origSun = 0.f, origSky = 0.f;
++    std::vector<float> origLights;
++    std::vector<std::vector<float>> refs;
++    int refW = 0, refH = 0;
++    FILE* csv = nullptr;
++
++    bool Load(const char* path)
++    {
++        std::ifstream f(path);
++        if (!f) return false;
++        std::string line;
++        std::vector<std::pair<int, int>> timeline;
++        while (std::getline(f, line))
++        {
++            if (line.empty() || line[0] == '#') continue;
++            std::istringstream ss(line);
++            std::string k; ss >> k;
++            if (k == "mode") ss >> mode;
++            else if (k == "tech") ss >> tech;
++            else if (k == "denoiser") ss >> denoiser;
++            else if (k == "sharcaccum") ss >> sharcAccum;
++            else if (k == "nrcmaxrad") ss >> nrcMaxRad;
++            else if (k == "snapshots") ss >> snapshots;
++            else if (k == "eventboost") ss >> eventBoost;
++            else if (k == "eventclear") ss >> eventClear;
++            else if (k == "eventbypass") ss >> eventBypass;
++            else if (k == "bypassbounces") ss >> bypassBounces;     // 0 = contournement complet, K = pas de requete avant le rebond K
++            else if (k == "bypassadaptive") ss >> bypassAdaptive;   // 1 = arret quand la perte d'entrainement NRC se stabilise
++            else if (k == "probes") { std::getline(ss, probesPath); while (!probesPath.empty() && probesPath[0] == ' ') probesPath.erase(0, 1); }
++            else if (k == "spp") ss >> spp;
++            else if (k == "out") { std::getline(ss, out); while (!out.empty() && out[0] == ' ') out.erase(0, 1); }
++            else if (k == "warmup") ss >> warmup;
++            else if (k == "refframes") ss >> refFrames;
++            else if (k == "state")
++            {
++                BenchState s; ss >> s.sun >> s.sky; std::string tok;
++                while (ss >> tok) { if (tok[0] == 'o') s.obj = atoi(tok.c_str() + 1); else s.lights.push_back((float)atof(tok.c_str())); }
++                states.push_back(s);
++            }
++            else if (k == "depinv") ss >> depInv;
++            else if (k == "compactsnap") ss >> compactSnap;
++            else if (k == "depreset") ss >> depReset;
++            else if (k == "dlss") ss >> dlss;
++            else if (k == "dlssreset") ss >> dlssReset;   // 1 = l'historique DLSS est oublie a l'evenement
++            else if (k == "refs") { std::getline(ss, refDir); while (!refDir.empty() && refDir[0] == ' ') refDir.erase(0, 1); }   // dossier des references (defaut : ../ref)
++            else if (k == "depgrid") ss >> gridMin[0] >> gridMin[1] >> gridMin[2] >> gridMax[0] >> gridMax[1] >> gridMax[2];
++            else if (k == "object") ss >> objNode >> objHalf[0] >> objHalf[1] >> objHalf[2];
++            else if (k == "objpos") { std::array<float, 6> p = { 0, 0, 0, -1, -1, -1 }; ss >> p[0] >> p[1] >> p[2]; ss >> p[3] >> p[4] >> p[5]; objPos.push_back(p); }
++            else if (k == "campath") ss >> camAmp >> camYaw >> camPeriod;
++            else if (k == "poses") ss >> poses;
++            else if (k == "timeline" || k == "capture")
++            {
++                std::string rest; ss >> rest; std::stringstream t(rest); std::string tok;
++                while (std::getline(t, tok, ','))
++                {
++                    if (k == "capture") captures.push_back(atoi(tok.c_str()));
++                    else { size_t c = tok.find(':'); timeline.push_back({ atoi(tok.substr(0, c).c_str()), atoi(tok.substr(c + 1).c_str()) }); }
++                }
++            }
++        }
++        if (mode == "ref" && poses > 0)
++        {
++            std::vector<int> only;   // "refstates" optionnel : on ne calcule que ces etats
++            for (int s = 0; s < (int)states.size(); ++s) for (int p = 0; p < poses; ++p) for (int i = 0; i < refFrames; ++i) { seq.push_back(s); seqPose.push_back(p); }
++        }
++        else if (mode == "ref") for (int s = 0; s < (int)states.size(); ++s) for (int i = 0; i < refFrames; ++i) seq.push_back(s);
++        else for (auto& p : timeline) for (int i = 0; i < p.second; ++i) seq.push_back(p.first);
++        active = !seq.empty() && !states.empty();
++        return active;
++    }
++
++    std::string Path(const std::string& name) const { return out + "/" + name; }
++    float CamPhase(int f) const
++    {
++        if (camPeriod <= 0) return 0.f;
++        if (mode == "ref" && poses > 0) return f < 0 ? 0.f : (float)seqPose[f] / poses;
++        return f < 0 ? 0.f : (float)(f % camPeriod) / camPeriod;
++    }
++    int RefPose(int f) const
++    {
++        if (poses <= 0) return 0;
++        if (mode == "ref") return f < 0 ? 0 : seqPose[f];
++        int ph = f % camPeriod, step = camPeriod / poses;
++        return (ph % step == 0) ? ph / step : -1;
++    }
++    int SegKey(int f) const { return seq[f] * 1000 + ((mode == "ref" && poses > 0) ? seqPose[f] : 0); }
++    std::string RefName(int s, int p) const { return poses > 0 ? "ref_" + std::to_string(s) + "_" + std::to_string(p) + ".bin" : "ref_" + std::to_string(s) + ".bin"; }
++
++    static bool WriteImage(const std::string& path, int w, int h, const std::vector<float>& rgb)
++    {
++        FILE* fp = fopen(path.c_str(), "wb");
++        if (!fp) return false;
++        fwrite(&w, 4, 1, fp); fwrite(&h, 4, 1, fp);
++        fwrite(rgb.data(), 4, rgb.size(), fp);
++        fclose(fp);
++        return true;
++    }
++    static bool ReadImage(const std::string& path, int& w, int& h, std::vector<float>& rgb)
++    {
++        FILE* fp = fopen(path.c_str(), "rb");
++        if (!fp) return false;
++        fread(&w, 4, 1, fp); fread(&h, 4, 1, fp);
++        rgb.resize((size_t)w * h * 3);
++        fread(rgb.data(), 4, rgb.size(), fp);
++        fclose(fp);
++        return true;
++    }
++    // erreur par tuiles (moyennes de 60x60 pixels) : le bruit s'efface, le retard d'eclairage reste
++    static double TileRelErr(const std::vector<float>& a, const std::vector<float>& ref, int w, int h, int T = 60)
++    {
++        double s2 = 0, m = 0; int n = 0;
++        for (int ty = 0; ty + T <= h; ty += T) for (int tx = 0; tx + T <= w; tx += T)
++        {
++            double sa = 0, sr = 0;
++            for (int y = ty; y < ty + T; ++y) for (int x = tx; x < tx + T; ++x) for (int k = 0; k < 3; ++k)
++            { size_t i = 3 * ((size_t)y * w + x) + k; sa += a[i]; sr += ref[i]; }
++            sa /= 3.0 * T * T; sr /= 3.0 * T * T;
++            s2 += (sa - sr) * (sa - sr); m += sr; n++;
++        }
++        m /= std::max(n, 1);
++        return std::sqrt(s2 / std::max(n, 1)) / std::max(m, 1e-9);
++    }
++    bool LoadProbes()
++    {
++        if (probesPath.empty()) return false;
++        FILE* fp = fopen(probesPath.c_str(), "rb");
++        if (!fp) return false;
++        fread(&probeW, 4, 1, fp); fread(&probeH, 4, 1, fp);
++        probes.resize((size_t)probeW * probeH * std::max(poses, 1));
++        size_t got = fread(probes.data(), 1, probes.size(), fp);
++        if (got < probes.size()) probes.resize(got);
++        fclose(fp);
++        return true;
++    }
++    // par sonde (bit) : ecart de luminosite moyenne (%) et ecart perceptuel RMS de log(1 + x/m)
++    void ProbeMetrics(const std::vector<float>& a, const std::vector<float>& ref, int w, int h, int bit, double& biasPct, double& logRms, int pose = 0) const
++    {
++        const uint8_t* probes = this->probes.data() + (size_t)w * h * (((size_t)(pose + 1) * w * h <= this->probes.size()) ? pose : 0);
++        double sa = 0, sr = 0; size_t n = 0;
++        for (size_t p = 0; p < (size_t)w * h; ++p)
++            if ((probes[p] >> bit) & 1) { for (int k = 0; k < 3; ++k) { sa += a[3 * p + k]; sr += ref[3 * p + k]; } n += 3; }
++        if (!n || sr <= 0) { biasPct = 0; logRms = 0; return; }
++        double m = sr / n;
++        double s2 = 0;
++        for (size_t p = 0; p < (size_t)w * h; ++p)
++            if ((probes[p] >> bit) & 1)
++                for (int k = 0; k < 3; ++k) { double d = std::log1p(a[3 * p + k] / m) - std::log1p(ref[3 * p + k] / m); s2 += d * d; }
++        biasPct = (sa / sr - 1.0) * 100.0;
++        logRms = std::sqrt(s2 / n);
++    }
++    // erreur relative : RMSE (RVB) / moyenne de la reference
++    static double RelRmse(const std::vector<float>& a, const std::vector<float>& ref, double* meanOut = nullptr)
++    {
++        double s2 = 0, m = 0; size_t n = std::min(a.size(), ref.size());
++        for (size_t i = 0; i < n; ++i) { double d = (double)a[i] - ref[i]; s2 += d * d; m += ref[i]; }
++        m /= std::max<size_t>(n, 1);
++        if (meanOut) *meanOut = m;
++        return std::sqrt(s2 / std::max<size_t>(n, 1)) / std::max(m, 1e-9);
++    }
++};
+diff --git a/Samples/Pathtracer/BenchSnap.hlsl b/Samples/Pathtracer/BenchSnap.hlsl
+new file mode 100644
+index 0000000..9571128
+--- /dev/null
++++ b/Samples/Pathtracer/BenchSnap.hlsl
+@@ -0,0 +1,57 @@
++// Banc : instantanes SHaRC compacts. Seules les entrees valides sont gardees : indice, cle, lumiere resolue (24 octets)
++struct SnapRec
++{
++    uint index;
++    uint sampleData;
++    uint2 key;
++    uint2 radiance;   // 4 x fp16 (radiance rgb + nombre d'echantillons)
++};
++
++RWStructuredBuffer<uint2>   u_Hash      : register(u0, space3);
++RWStructuredBuffer<uint4>   u_Resolved  : register(u3, space3);
++RWStructuredBuffer<SnapRec> u_Snap      : register(u5, space3);
++RWStructuredBuffer<uint>    u_Counter   : register(u6, space3);
++
++struct SnapConstants { uint capacity; uint count; uint pad0; uint pad1; };
++ConstantBuffer<SnapConstants> g_Snap : register(b0, space3);
++
++bool IsValid(uint id, out uint2 k, out uint4 r)
++{
++    k = u_Hash[id];
++    r = u_Resolved[id];
++    return (k.x | k.y) != 0 && (r.y >> 16) != 0;   // cle presente et au moins un echantillon
++}
++
++[numthreads(256, 1, 1)]
++void snapCount(uint id : SV_DispatchThreadID)
++{
++    if (id >= g_Snap.capacity) return;
++    uint2 k; uint4 r;
++    if (IsValid(id, k, r)) InterlockedAdd(u_Counter[0], 1);
++}
++
++[numthreads(256, 1, 1)]
++void snapPack(uint id : SV_DispatchThreadID)
++{
++    if (id >= g_Snap.capacity) return;
++    uint2 k; uint4 r;
++    if (!IsValid(id, k, r)) return;
++    uint slot;
++    InterlockedAdd(u_Counter[0], 1, slot);
++    if (slot >= g_Snap.count) return;
++    SnapRec rec;
++    rec.index = id;
++    rec.sampleData = r.z;
++    rec.key = k;
++    rec.radiance = r.xy;
++    u_Snap[slot] = rec;
++}
++
++[numthreads(256, 1, 1)]
++void snapRestore(uint id : SV_DispatchThreadID)
++{
++    if (id >= g_Snap.count) return;
++    SnapRec rec = u_Snap[id];
++    u_Hash[rec.index] = rec.key;
++    u_Resolved[rec.index] = uint4(rec.radiance, rec.sampleData & 0xFFFFu, 0);   // plus aucune image "perimee"
++}

@@ -1,0 +1,10 @@
+# nom;etat:frames,...   etats : 0 base, 1 mur effondre, 2 objets deplaces, 3 quatre lampes eteintes,
+#                                4 trois lampes neuves allumees, 5 lampes eteintes + mur effondre
+G1 mur effondre;0:50,1:50
+G2 mur effondre puis reconstruit;0:50,1:30,0:50
+G3 quatre objets deplaces;0:50,2:50
+G4 objets aller-retour;0:50,2:30,0:50
+L1 quatre lampes eteintes;0:50,3:50
+L2 quatre lampes eteintes puis rallumees;0:50,3:30,0:50
+L3 trois lampes allumees 1re fois;0:50,4:50
+M1 extinction, mur effondre dans le noir, rallumage;0:40,3:20,5:20,1:50

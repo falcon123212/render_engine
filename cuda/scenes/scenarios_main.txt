@@ -1,0 +1,7 @@
+R1 allumee-eteinte-rallumee;0:50,1:30,0:50
+R2 allumee-eteinte-porte-rallumee;0:40,1:20,2:20,3:50
+R3 porte ouverte-fermee-rouverte;0:50,3:30,0:50
+I1 lampe eteinte;0:50,1:50
+I2 porte;1:50,2:50
+I3 lampe allumee 1re fois;2:50,3:50
+I4 boite;3:50,4:50

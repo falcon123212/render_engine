@@ -1,0 +1,104 @@
+{
+ "models": [
+  "Bistro/bistro.gltf",
+  "BenchBox/box.gltf"
+ ],
+ "graph": [
+  {
+   "name": "Bistro",
+   "model": 0
+  },
+  {
+   "name": "Panneau",
+   "model": 1,
+   "translation": [
+    -11.2,
+    0.9,
+    17.4
+   ],
+   "scaling": [
+    1.4,
+    1.8,
+    0.1
+   ]
+  },
+  {
+   "name": "DefaultCamera",
+   "type": "PerspectiveCamera",
+   "translation": [
+    -12.63,
+    1.71,
+    21.66
+   ],
+   "rotation": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "verticalFov": 0.7,
+   "zNear": 0.01,
+   "enableAutoExposure": true,
+   "exposureCompensation": 2.2,
+   "exposureValue": -2.0
+  },
+  {
+   "name": "Lights",
+   "children": [
+    {
+     "name": "Sun",
+     "type": "DirectionalLight",
+     "radianceScale": [
+      1,
+      1,
+      1
+     ],
+     "angularSize": 1.0,
+     "translation": [
+      -15.0,
+      40.0,
+      10.0
+     ],
+     "rotation": [
+      0,
+      0,
+      0,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "name": "Lampe0",
+   "type": "PointLight",
+   "translation": [
+    -12.2,
+    2.6,
+    18.8
+   ],
+   "intensity": 60.0,
+   "color": [
+    1.0,
+    0.85,
+    0.6
+   ],
+   "radius": 0.1
+  },
+  {
+   "name": "Lampe1",
+   "type": "PointLight",
+   "translation": [
+    -14.0,
+    2.6,
+    16.5
+   ],
+   "intensity": 60.0,
+   "color": [
+    1.0,
+    0.85,
+    0.6
+   ],
+   "radius": 0.1
+  }
+ ]
+}
