@@ -1,0 +1,6 @@
+{"type":"scene","np":1082802,"nt":58,"gpu":"NVIDIA GeForce RTX 4060","mask_bits":128}
+{"type":"vram","contexte_mb":1081.5,"scene_mb":316.0,"cache_tous_buffers_mb":180.0,"ram_pic_mb":158.5,"ram_debut_mb":125.2}
+{"type":"cpu","name":"Classique","cpu_ms_par_frame":0.0521,"mur_ms_par_frame":1.0944}
+{"type":"cpu","name":"SHaRC responsive","cpu_ms_par_frame":0.0174,"mur_ms_par_frame":1.0944}
+{"type":"cpu","name":"v3","cpu_ms_par_frame":0.0521,"mur_ms_par_frame":1.4233}
+{"type":"cpu","name":"v4-A2C","cpu_ms_par_frame":0.0174,"mur_ms_par_frame":1.4411}

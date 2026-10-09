@@ -9,6 +9,9 @@ Sous Linux, on lance le **bench CUDA** (dossier `cuda/`). Il compare le « cache
 Le bench SHaRC / NRC officiel de NVIDIA (dossier `windows/`) ne tourne **pas** sous Linux : NVIDIA ne fournit NRC qu'en DLL Windows. Tu peux ignorer ce dossier.
 *The official NVIDIA SHaRC / NRC bench (`windows/`) does **not** run on Linux: NRC ships as Windows DLLs only. Ignore that folder.*
 
+> **Tu as déjà fait le bench une première fois ?** Va directement à la section [« Mise à jour du 9 octobre 2026 »](#mise-à-jour-du-9-octobre-2026--update-2026-10-09) en bas : il y a deux choses nouvelles à lancer (~10 min en tout).
+> *Already ran the bench once? Jump to the "Update 2026-10-09" section at the bottom: two new things to run (~10 min total).*
+
 ---
 
 ## Étape 0 · Ce qu'il faut / Requirements
@@ -160,6 +163,7 @@ Le mode débogage synchronise le GPU après chaque noyau : **ses temps ne sont p
 - **Ne pas utiliser la machine** pendant les mesures, et ne rien faire tourner d'autre sur le GPU.
 - **Si c'est interrompu**, relance la même commande : ce qui est déjà fait est sauté.
 - **Attendu** : `fini / done : ../results/cuda/RESULTATS_CUDA.md`. Ce fichier contient les tableaux (qualité par scénario, gain G, temps GPU, ressources).
+- Le bench complet inclut maintenant les grandes scènes de **530 k et 1 M points** (taille réelle d'un cache dans un moteur). Elles sont stockées compressées (`.bin.gz`) et décompressées automatiquement (~210 Mo sur le disque).
 
 *Don't use the machine or the GPU meanwhile. If interrupted, rerun the same command (finished parts are skipped). Expected: `results/cuda/RESULTATS_CUDA.md`.*
 
@@ -191,8 +195,78 @@ Le mode débogage synchronise le GPU après chaque noyau : **ses temps ne sont p
 ## Ce que mesure le bench / What is measured
 
 - **Qualité** : erreur moyenne sur les 30 images qui suivent le dernier événement de chaque scénario (plus bas = mieux), sur 10 graines.
-- **Gain G** : erreur de la meilleure baseline divisée par celle de la méthode, à temps GPU égal.
+- **Gain G** : erreur de la baseline divisée par celle de la méthode, à temps GPU égal, en moyenne géométrique sur les scénarios. Deux définitions sont données :
+  - **config fixe** : la meilleure baseline unique, avec un seul réglage pour tous les scénarios (comme un moteur, qui choisit un réglage et le garde) ;
+  - **par scénario** : la meilleure baseline choisie séparément pour chaque scénario. C'est plus sévère, comme un adversaire qui saurait d'avance quel événement arrive.
   - Verdict : G ≥ 2 rupture ; 1,15 à 2 gain net ; 0,87 à 1,15 équivalent ; moins de 0,87 régression.
 - **Comparaison** : les résultats de référence d'une RTX 4060 sont dans `reference/cuda_rtx4060/RESULTATS_CUDA.md`.
-  - G ≈ 1,8 à 2,1 contre les baselines telles que publiées ;
-  - G ≈ 1,1 contre des baselines qui reprennent la mémoire et les instantanés.
+  - G ≈ 2,2 à 2,5 (config fixe) ou 1,8 à 2,1 (par scénario) contre les baselines telles que publiées ;
+  - G ≈ 1,2 à 1,3 (config fixe) ou 1,1 (par scénario) contre des baselines qui reprennent la mémoire et les instantanés.
+  - Temps à 1 M points sur RTX 4060 : 1,10 ms par image pour le classique, 1,45 ms pour la v4 (+0,34 ms).
+
+---
+
+## Mise à jour du 9 octobre 2026 / Update 2026-10-09
+
+Deux nouveautés. Commence par récupérer la dernière version du dépôt :
+*Two new things. First, get the latest version of the repo:*
+
+```bash
+cd render_engine
+```
+
+```bash
+git pull
+```
+
+### A. Temps et ressources à 530 k et 1 M points (~1 à 5 min)
+
+Le premier passage n'a mesuré le temps qu'à 43 k et 170 k points. À ces tailles, la carte n'est pas pleinement occupée, et les temps ne disent pas grand-chose du coût réel. Cette commande ne lance **que** les nouvelles mesures, sans refaire le reste :
+*The first run only timed 43 k and 170 k points, too small to load the GPU. This runs **only** the new measurements:*
+
+```bash
+./cuda/run_cuda.sh --echelle
+```
+
+**Attendu / expected** : `decompression` de deux scènes, puis `timing_530k.jsonl`, `timing_1M.jsonl`, `res_1M.jsonl` et `fini / done`. Sur une RTX 4060, ça prend moins d'une minute.
+
+Puis renvoie les résultats comme d'habitude (étape 8) :
+*Then send the results back as usual (step 8):*
+
+```bash
+./cuda/run_cuda.sh --pack
+```
+
+### B. Télécharger les scènes publiques de NVIDIA (~100 Mo, 1 à 2 min ; Bistro : +2,3 Go)
+
+La prochaine version du bench testera la méthode sur des scènes **publiques** que tout le monde connaît, et plus seulement sur nos scènes en boîtes. Ce sont les scènes du dépôt officiel de NVIDIA [RTXGI-Assets](https://github.com/NVIDIAGameWorks/RTXGI-Assets), celles que NVIDIA utilise pour ses démos SHaRC et RTXGI. Elles sont au format glTF, sans Git LFS ni compte à créer.
+*The next bench version will test on well-known **public** scenes from NVIDIA's official RTXGI-Assets repo (glTF, no Git LFS, no account).*
+
+| Scène | Taille | Intérêt |
+|---|---|---|
+| CornellBox | 12 Ko | Valider le convertisseur |
+| Bathroom | 6 Mo | Petit intérieur |
+| LivingRoom | 43 Mo | Intérieur meublé |
+| Sponza | 52 Mo | La référence classique |
+| Bistro | 2,3 Go | La scène de NVIDIA pour SHaRC, la même que le banc Windows |
+
+**Les petites scènes** (sans Bistro) :
+
+```bash
+./scenes_publiques/telecharger.sh
+```
+
+**Avec Bistro**, quand la connexion le permet (le script reprend ce qui est déjà téléchargé) :
+
+```bash
+./scenes_publiques/telecharger.sh --bistro
+```
+
+**Attendu / expected** : une ligne `OK` par scène, avec sa taille et le chemin de son fichier `.gltf`, puis `fini / done`. Les scènes vont dans `scenes_publiques/RTXGI-Assets/`, qui n'est pas versionné. En cas de coupure, relance la même commande.
+*One `OK` line per scene, then `fini / done`. If interrupted, rerun the same command.*
+
+**Important :** le bench ne sait **pas encore** lire ces scènes. Le convertisseur glTF et le traceur adapté aux grandes scènes arrivent dans une prochaine mise à jour. Ce téléchargement sert seulement à les avoir prêtes. Il n'y a rien à mesurer ni à renvoyer pour cette partie.
+*The bench **cannot read these scenes yet**: the glTF converter and large-scene tracer come in a later update. This only gets them ready; nothing to measure or send back for this part.*
+
+Licences : chaque scène vient directement de NVIDIA et garde sa licence (Bistro : CC-BY 4.0, Amazon Lumberyard ; Sponza : voir `Sponza/README.md`). Ce dépôt ne les redistribue pas.
+*Licences: scenes come straight from NVIDIA with their own licences; this repo does not redistribute them.*

@@ -5,6 +5,7 @@
 #   ./cuda/run_cuda.sh             banc complet / full bench            (~20-40 min)
 #   ./cuda/run_cuda.sh --test      verification rapide / quick check    (~1 min)
 #   ./cuda/run_cuda.sh --debug     traces de debogage / debug traces    (~5 min)
+#   ./cuda/run_cuda.sh --echelle   seulement temps + ressources a 530 k et 1 M points / only scale runs (~5-10 min)
 #   ./cuda/run_cuda.sh --pack      archive des resultats a renvoyer / results archive to send back
 #
 # Mode --debug (voir LINUX.md) :
@@ -16,7 +17,7 @@ cd "$(dirname "$0")"
 PY=$(command -v python3 || command -v python || true)
 [ -n "$PY" ] || { echo "ERREUR : python3 introuvable / python3 not found"; exit 1; }
 MODE=full
-case "$1" in --test) MODE=test;; --debug) MODE=debug;; --pack) MODE=pack;; "") ;; *) echo "argument inconnu / unknown argument: $1"; exit 1;; esac
+case "$1" in --test) MODE=test;; --debug) MODE=debug;; --pack) MODE=pack;; --echelle) MODE=echelle;; "") ;; *) echo "argument inconnu / unknown argument: $1"; exit 1;; esac
 step () { echo "$(date '+%H:%M:%S') $*"; }
 
 if [ $MODE = pack ]; then
@@ -35,7 +36,7 @@ if [ ! -f "poc_gpu_l3$EXT" ] || [ ! -f "poc_gpu_l8$EXT" ]; then
   if [ -n "$EXT" ]; then cmd //c "$(cygpath -w "$PWD/build_windows.bat")"; else ./build.sh; fi
 fi
 
-case $MODE in full) OUT="../results/cuda"; SEEDS=10;; test) OUT="../results/cuda_test"; SEEDS=1;; debug) OUT="../results/cuda_debug"; SEEDS=1;; esac
+case $MODE in full|echelle) OUT="../results/cuda"; SEEDS=10;; test) OUT="../results/cuda_test"; SEEDS=1;; debug) OUT="../results/cuda_debug"; SEEDS=1;; esac
 mkdir -p "$OUT"
 { date '+%F %T'; nvidia-smi --query-gpu=name,driver_version,memory.total,compute_cap --format=csv 2>/dev/null || true
   nvcc --version 2>/dev/null | tail -2; uname -a; grep PRETTY_NAME /etc/os-release 2>/dev/null || true; } > "$OUT/systeme_cuda.txt"
@@ -81,13 +82,23 @@ if [ $MODE = debug ]; then
   exit 0
 fi
 
+if [ $MODE != echelle ]; then
 R res_170k.jsonl     ./poc_gpu_l3$EXT res scenes/scene_scale_170k.bin
 R timing_43k.jsonl   ./poc_gpu_l3$EXT timing scenes/scene_scale_43k.bin
 R timing_170k.jsonl  ./poc_gpu_l3$EXT timing scenes/scene_scale_170k.bin
 R scen_main.jsonl    ./poc_gpu_l3$EXT scenf scenes/scene_main.bin $SEEDS scenes/scenarios_main.txt
 R scen_holdout.jsonl ./poc_gpu_l3$EXT scenf scenes/scene_holdout.bin $SEEDS scenes/scenarios_main.txt
 R scen_stress.jsonl  ./poc_gpu_l8$EXT scenf scenes/scene_stress.bin $SEEDS scenes/scenarios_stress.txt
+fi
+if [ $MODE = full ] || [ $MODE = echelle ]; then   # grandes scenes (taille reelle d'un cache de moteur), compressees dans le depot
+  for n in 530k 1M; do
+    [ -f scenes/scene_scale_$n.bin ] || { step "decompression / unpacking scene_scale_$n.bin"; gzip -dc scenes/scene_scale_$n.bin.gz > scenes/scene_scale_$n.bin; }
+  done
+  R timing_530k.jsonl ./poc_gpu_l3$EXT timing scenes/scene_scale_530k.bin
+  R timing_1M.jsonl   ./poc_gpu_l3$EXT timing scenes/scene_scale_1M.bin
+  R res_1M.jsonl      ./poc_gpu_l3$EXT res scenes/scene_scale_1M.bin
+fi
 PYTHONIOENCODING=utf-8 "$PY" analyse_cuda.py "$OUT" > "$OUT/RESULTATS_CUDA.md"
 step "fini / done : $OUT/RESULTATS_CUDA.md"
-[ $MODE = full ] && step "Pour renvoyer les resultats / to send results back : ./cuda/run_cuda.sh --pack"
+[ $MODE != test ] && step "Pour renvoyer les resultats / to send results back : ./cuda/run_cuda.sh --pack"
 exit 0

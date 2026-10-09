@@ -1,0 +1,10 @@
+{"type":"scene","np":1082802,"nt":58,"gpu":"NVIDIA GeForce RTX 4060","mask_bits":128}
+{"type":"timing","name":"Classique 1.0x","trace":0.91348,"decide":0.00160,"update":0.18226,"swap":0.00758,"event":0.00761}
+{"type":"timing","name":"Classique 2.0x","trace":1.54605,"decide":0.00163,"update":0.18418,"swap":0.00744,"event":0.00625}
+{"type":"timing","name":"SHaRC responsive 1.0x","trace":0.91531,"decide":0.00159,"update":0.18199,"swap":0.00607,"event":0.02087}
+{"type":"timing","name":"DDGI 1.0x","trace":2.06722,"decide":0.00155,"update":0.22714,"swap":0.00720,"event":0.02448}
+{"type":"timing","name":"v3 sans suivi","trace":0.94973,"decide":0.00159,"update":0.18059,"swap":0.00533,"event":0.06655}
+{"type":"timing","name":"v3 complet","trace":1.70418,"decide":0.00255,"update":0.20442,"swap":0.01223,"event":0.17309}
+{"type":"timing","name":"v3 suivi 1 frame sur 2","trace":1.38647,"decide":0.00229,"update":0.19439,"swap":0.01061,"event":0.20579}
+{"type":"timing","name":"v3 suivi 1 frame sur 4","trace":1.21593,"decide":0.00231,"update":0.18935,"swap":0.00927,"event":0.19571}
+{"type":"timing","name":"v4-A2C suivi 1/4","trace":1.21398,"decide":0.00297,"update":0.22088,"swap":0.01023,"event":0.17610}

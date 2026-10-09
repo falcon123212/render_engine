@@ -135,6 +135,10 @@ Sous Windows, dans une invite de commandes classique : `cuda\build_windows.bat`.
 
 **3. Renvoyer les résultats** : `./cuda/run_cuda.sh --pack` crée une archive `.tar.gz` à envoyer.
 
+**Déjà lancé une fois ?** `git pull`, puis `./cuda/run_cuda.sh --echelle` : seulement les nouvelles mesures de temps et de ressources à 530 k et 1 M points. Détails dans [LINUX.md](LINUX.md#mise-à-jour-du-9-octobre-2026--update-2026-10-09).
+
+**Scènes publiques** (Sponza, Bistro… du dépôt officiel NVIDIA RTXGI-Assets) : `./scenes_publiques/telecharger.sh` (ajouter `--bistro` pour Bistro, +2,3 Go). Le bench ne les lit pas encore : c'est la préparation d'une prochaine version.
+
 ### Ce qui est mesuré
 
 Trois scènes : la principale, une scène de validation jamais vue pendant la mise au point, et une scène « stress » à 8 lampes avec un mur mobile. Chacune passe par 7 à 8 scénarios d'événements, avec 10 graines.
@@ -143,7 +147,7 @@ Trois scènes : la principale, une scène de validation jamais vue pendant la mi
 - **Gain G** : rapport de l'erreur de la meilleure baseline sur celle de la méthode, à temps GPU égal.
 - **Temps GPU** de chaque étape, et ressources (VRAM, CPU).
 
-Référence RTX 4060 : `reference/cuda_rtx4060/RESULTATS_CUDA.md`. Elle donne **G ≈ 1,8 à 2,1 contre les baselines telles que publiées**, mais **≈ 1,1 contre des baselines qui reprennent la mémoire et les instantanés**.
+Référence RTX 4060 : `reference/cuda_rtx4060/RESULTATS_CUDA.md`. Elle donne **G ≈ 2,2 à 2,5 contre les baselines telles que publiées** (1,8 à 2,1 si on prend la meilleure baseline scénario par scénario), mais **≈ 1,2 à 1,3 contre des baselines qui reprennent la mémoire et les instantanés** (≈ 1,1 scénario par scénario). Le rapport donne les deux définitions de G.
 
 ---
 
@@ -170,6 +174,8 @@ This repo benchmarks "ghost lighting" in NVIDIA's radiance caches (SHaRC and NRC
   - Finally `./windows/pack.sh`, and send back the resulting zip.
   - Prerequisites: VS 2022 with C++ and the Windows SDK, CMake ≥ 3.24, Git for Windows + Git LFS, Vulkan SDK, Python + numpy, a recent NVIDIA driver (≥ 572 for RTX 50), ~30 GB free disk. Do not use the PC or minimise the render window during the runs.
 - **Bench B (Linux and Windows, CUDA)**: see **[LINUX.md](LINUX.md)**. `./cuda/build.sh` (CUDA ≥ 12.8), `./cuda/run_cuda.sh --test`, `--debug` (NVTX / kernel-checked traces), then `./cuda/run_cuda.sh` and `./cuda/run_cuda.sh --pack`.
+  - Already ran it? `git pull`, then `./cuda/run_cuda.sh --echelle` (new 530 k / 1 M point timing only) and `--pack`.
+  - Public scenes (Sponza, Bistro… from NVIDIA's RTXGI-Assets): `./scenes_publiques/telecharger.sh [--bistro]`. Not read by the bench yet.
 - Reference results for an RTX 4060 are in `reference/`.
 
 ## Licences
