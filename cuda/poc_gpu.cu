@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <cstdarg>
+#include <map>
 #include <cstdlib>
 #ifdef _WIN32
 #define NOMINMAX
@@ -37,6 +39,54 @@ static double vram_used_mb() { size_t f, t; cudaMemGetInfo(&f, &t); return (t - 
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
     fprintf(stderr, "CUDA %s @ %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__); exit(1); } } while (0)
+
+// ---------------------------------------------------------------------------------------------------------------
+// Traces de debogage / debug traces
+//  - NVTX (NVIDIA Tools Extension, livree avec le CUDA Toolkit) : plages nommees visibles dans Nsight Systems
+//    (nsys profile --trace=cuda,nvtx ...). Toujours actives, cout negligeable.
+//  - BENCH_DEBUG=1 : trace de chaque etape sur stderr + verification SYNCHRONE de chaque lancement de noyau
+//    (cudaGetLastError + cudaDeviceSynchronize) : la premiere erreur GPU est attribuee au bon noyau.
+//    BENCH_DEBUG=2 : trace aussi chaque appel de noyau (tres verbeux).
+// ---------------------------------------------------------------------------------------------------------------
+#if defined(__has_include)
+#if __has_include(<nvtx3/nvToolsExt.h>)
+#include <nvtx3/nvToolsExt.h>
+#define HAVE_NVTX 1
+#endif
+#endif
+#ifndef HAVE_NVTX
+static inline int nvtxRangePushA(const char*) { return 0; }
+static inline int nvtxRangePop() { return 0; }
+static inline void nvtxMarkA(const char*) {}
+#endif
+static int g_debug = 0;
+static std::map<std::string, long long>& kcount() { static std::map<std::string, long long> m; return m; }
+static void DBG(const char* fmt, ...) {
+    if (!g_debug) return;
+    va_list a; va_start(a, fmt);
+    fprintf(stderr, "[trace] "); vfprintf(stderr, fmt, a); fprintf(stderr, "\n"); fflush(stderr);
+    va_end(a);
+}
+static void DBG_K(const char* name) {   // appele apres chaque lancement de noyau
+    if (!g_debug) return;
+    long long n = ++kcount()[name];
+    cudaError_t e1 = cudaGetLastError();
+    cudaError_t e2 = cudaDeviceSynchronize();
+    if (e1 != cudaSuccess || e2 != cudaSuccess) {
+        fprintf(stderr, "[trace] ERREUR GPU dans le noyau %s (appel %lld) : lancement = %s, execution = %s\n",
+                name, n, cudaGetErrorString(e1), cudaGetErrorString(e2));
+        fflush(stderr);
+        exit(2);
+    }
+    if (n == 1 || g_debug >= 2) DBG("noyau %-20s appel %lld ok", name, n);
+}
+static void DBG_SUMMARY() {
+    if (!g_debug) return;
+    long long t = 0;
+    for (auto& kv : kcount()) { DBG("bilan : %-20s %lld appels", kv.first.c_str(), kv.second); t += kv.second; }
+    DBG("bilan : %lld lancements de noyaux verifies, aucune erreur", t);
+}
+struct NvtxScope { explicit NvtxScope(const char* n) { nvtxRangePushA(n); } ~NvtxScope() { nvtxRangePop(); } };
 
 #ifndef GX
 #define GX 16
@@ -585,7 +635,7 @@ Scene load(const char* path) {
     S.dL = dput(S.L); S.dA = dput(S.A); S.dRegion = dput(S.region);
     int B = 256, G = (S.Np + B - 1) / B;
     size_t shm = S.Nt * 10 * sizeof(float);
-    for (auto& d : S.st) k_build<<<G, B, shm>>>(d, S.dL, S.Np);
+    for (auto& d : S.st) (k_build<<<G, B, shm>>>(d, S.dL, S.Np), DBG_K("k_build"));
     CK(cudaDeviceSynchronize());
     return S;
 }
@@ -614,6 +664,8 @@ struct Runner {
     // seq : indice d'etat par frame. Renvoie l'erreur par frame (si ref et want_err).
     float *rec_sum = nullptr, *rec_sq = nullptr; int rec_f0 = 0, rec_nf = 0;
     std::vector<float> run(const Method& M, const std::vector<int>& seq, uint32_t seed, bool want_err, Timers* tm) {
+        NvtxScope nvtx_run(M.name.c_str());
+        DBG("run : methode \"%s\", graine %u, %zu images", M.name.c_str(), seed, seq.size());
         size_t Np = S.Np;
         int s0 = seq[0];
         // demarrage a chaud
@@ -642,6 +694,8 @@ struct Runner {
             if (f > 0 && seq[f - 1] != si) {
                 int e = seq[f - 1];
                 int pe = e * S.NS + si;   // paire d'etats (e -> si)
+                NvtxScope nvtx_ev("evenement");
+                if (g_debug >= 2 || f < 400) DBG("  image %zu : evenement, etat %d -> %d", f, e, si);
                 if (tm) cudaEventRecord(ev[4]);
                 if (M.snaps && (int)f - last_event_f >= 20) {   // v5 : instantane de l'etat qu'on quitte
                     int k = -1;
@@ -650,15 +704,15 @@ struct Runner {
                     slot_state[k] = e;
                     CK(cudaMemcpy(c.snap + (size_t)k * Np * NL, c.Lc, (size_t)Np * NL * 4, cudaMemcpyDeviceToDevice));
                 }
-                if (M.oracle && S.has_ref) k_oracle<<<G, B>>>(c, S.Np, S.st[e].ref, st.ref);
+                if (M.oracle && S.has_ref) (k_oracle<<<G, B>>>(c, S.Np, S.st[e].ref, st.ref), DBG_K("k_oracle"));
                 if (M.rescale && !M.deps) {   // classique renforce : stockage par lampe + mise a l'echelle (technique connue)
                     for (int l = 0; l < NL; ++l) {
                         float a = S.inten[e][l], b = S.inten[si][l];
                         if (a == b) continue;
                         if (M.memory && a > 0 && b == 0) { dormant |= 1 << l; ilearn[l] = a; }          // memoire naive
                         else if (M.memory && a == 0 && b > 0 && ((dormant >> l) & 1)) {                 // restauree telle quelle
-                            k_rescale<<<G, B>>>(c, S.Np, l, b / ilearn[l]); dormant &= ~(1 << l);
-                        } else if (a > 0) k_rescale<<<G, B>>>(c, S.Np, l, b / a);
+                            (k_rescale<<<G, B>>>(c, S.Np, l, b / ilearn[l]), DBG_K("k_rescale")); dormant &= ~(1 << l);
+                        } else if (a > 0) (k_rescale<<<G, B>>>(c, S.Np, l, b / a), DBG_K("k_rescale"));
                     }
                 }
                 if (M.deps) {
@@ -669,29 +723,29 @@ struct Runner {
                         if (M.memory && a > 0 && b == 0) {            // v4-A : mise en sommeil (pas d'effacement)
                             dormant |= 1 << l; ilearn[l] = a;
                         } else if (M.memory && a == 0 && b > 0 && ((dormant >> l) & 1)) {   // v4-A : reveil
-                            k_rescale<<<G, B>>>(c, S.Np, l, b / ilearn[l]);
+                            (k_rescale<<<G, B>>>(c, S.Np, l, b / ilearn[l]), DBG_K("k_rescale"));
                             dormant &= ~(1 << l); woke |= 1 << l;
                             if (M.wake_verify) {
                                 CK(cudaMemset(c.npend, 0, 8));
                                 CK(cudaMemset(c.rstat, 0, 4 * S.NR * 4));
-                                k_wake<<<G, B>>>(c, S.Np, l, 1, dormant);
+                                (k_wake<<<G, B>>>(c, S.Np, l, 1, dormant), DBG_K("k_wake"));
                                 CK(cudaMemcpy(c.npend, c.npend + 1, 4, cudaMemcpyDeviceToDevice));
                                 pend_left = VERIF_FRAMES;
-                            } else k_wake<<<G, B>>>(c, S.Np, l, 0, dormant);
-                        } else if (a > 0) k_rescale<<<G, B>>>(c, S.Np, l, b / a);    // linearite
+                            } else (k_wake<<<G, B>>>(c, S.Np, l, 0, dormant), DBG_K("k_wake"));
+                        } else if (a > 0) (k_rescale<<<G, B>>>(c, S.Np, l, b / a), DBG_K("k_rescale"));    // linearite
                     }
                     for (int l = 0; l < NL; ++l) {        // lampe neuve (sans memoire) : cellules concernees reinitialisees
                         int ix = pe * NL + l;
-                        if (!S.em[ix].empty() && !((woke >> l) & 1)) k_touched<<<G, B>>>(c, S.Np, dEm[ix], (int)S.em[ix].size(), 0, dormant);
+                        if (!S.em[ix].empty() && !((woke >> l) & 1)) (k_touched<<<G, B>>>(c, S.Np, dEm[ix], (int)S.em[ix].size(), 0, dormant), DBG_K("k_touched"));
                     }
                     if (!S.occ[pe].empty()) {
                         if (M.verify) {
                             CK(cudaMemset(c.npend, 0, 8));
                             CK(cudaMemset(c.rstat, 0, 4 * S.NR * 4));
-                            k_touched<<<G, B>>>(c, S.Np, dOcc[pe], (int)S.occ[pe].size(), 1, dormant);
+                            (k_touched<<<G, B>>>(c, S.Np, dOcc[pe], (int)S.occ[pe].size(), 1, dormant), DBG_K("k_touched"));
                             CK(cudaMemcpy(c.npend, c.npend + 1, 4, cudaMemcpyDeviceToDevice));
                             pend_left = VERIF_FRAMES;
-                        } else if (dormant) k_touched<<<G, B>>>(c, S.Np, dOcc[pe], (int)S.occ[pe].size(), 2, dormant);
+                        } else if (dormant) (k_touched<<<G, B>>>(c, S.Np, dOcc[pe], (int)S.occ[pe].size(), 2, dormant), DBG_K("k_touched"));
                     }
                 }
                 if (M.snaps) {
@@ -702,11 +756,11 @@ struct Runner {
                         if (M.snap_verify) {
                             CK(cudaMemset(c.npend, 0, 8));
                             CK(cudaMemset(c.rstat, 0, 4 * S.NR * 4));
-                            k_restored<<<G, B>>>(c, S.Np, M.nmax, dormant, 1);
+                            (k_restored<<<G, B>>>(c, S.Np, M.nmax, dormant, 1), DBG_K("k_restored"));
                             CK(cudaMemcpy(c.npend, c.npend + 1, 4, cudaMemcpyDeviceToDevice));
                             pend_left = VERIF_FRAMES;
                         } else {   // meme cle d'etat -> instantane valide par construction : pas de verification
-                            k_restored<<<G, B>>>(c, S.Np, M.nmax, dormant, 0);
+                            (k_restored<<<G, B>>>(c, S.Np, M.nmax, dormant, 0), DBG_K("k_restored"));
                             CK(cudaMemset(c.npend, 0, 8));
                             pend_left = 0;
                         }
@@ -721,7 +775,7 @@ struct Runner {
                 last_event_f = (int)f;
                 if (M.mode == 1) {   // la repartition des rayons doit voir l'invalidation de CETTE frame
                     CK(cudaMemsetAsync(c.sumpr, 0, 4));
-                    k_sumpr<<<G, B>>>(c, S.Np);
+                    (k_sumpr<<<G, B>>>(c, S.Np), DBG_K("k_sumpr"));
                 }
                 if (tm) { cudaEventRecord(ev[5]); cudaEventSynchronize(ev[5]); float ms; cudaEventElapsedTime(&ms, ev[4], ev[5]); tm->event += ms; tm->events++; }
             }
@@ -733,18 +787,18 @@ struct Runner {
             if (M.deps && f % 32 == 0) { std::swap(c.cur, c.prev); CK(cudaMemsetAsync(c.cur, 0, NW * Np * 4)); }
             if (tm) cudaEventRecord(ev[1]);
             bool track = M.deps && (f % M.track_every == 0);
-            if (track) k_trace2<true><<<G, B, shm>>>(st, c, p, S.dRegion, S.dA);
-            else k_trace2<false><<<G, B, shm>>>(st, c, p, S.dRegion, S.dA);
+            if (track) (k_trace2<true><<<G, B, shm>>>(st, c, p, S.dRegion, S.dA), DBG_K("k_trace2"));
+            else (k_trace2<false><<<G, B, shm>>>(st, c, p, S.dRegion, S.dA), DBG_K("k_trace2"));
             if (tm) cudaEventRecord(ev[2]);
             if (pend_left > 0) {
                 CK(cudaMemsetAsync(c.npend + 1, 0, 4));
-                k_decide<<<G, B>>>(c, p, S.dRegion);
+                (k_decide<<<G, B>>>(c, p, S.dRegion), DBG_K("k_decide"));
                 CK(cudaMemcpyAsync(c.npend, c.npend + 1, 4, cudaMemcpyDeviceToDevice));
                 pend_left--;
             }
             if (tm) cudaEventRecord(ev[3]);
             CK(cudaMemsetAsync(c.sumpr + 1, 0, 4));
-            k_update<<<G, B>>>(c, p, S.dRegion);
+            (k_update<<<G, B>>>(c, p, S.dRegion), DBG_K("k_update"));
             CK(cudaMemcpyAsync(c.sumpr, c.sumpr + 1, 4, cudaMemcpyDeviceToDevice));
             std::swap(c.Lc, c.Lc2);
             if (proj_left > 0 && --proj_left == 0) {
@@ -773,7 +827,7 @@ struct Runner {
                 CK(cudaMemcpy(c.coef, cf.data(), cf.size() * 4, cudaMemcpyHostToDevice));
                 CK(cudaMemset(c.npend, 0, 8));
                 CK(cudaMemset(c.rstat, 0, 4 * S.NR * 4));
-                k_proj_apply<<<G, B>>>(c, p, S.dRegion);
+                (k_proj_apply<<<G, B>>>(c, p, S.dRegion), DBG_K("k_proj_apply"));
                 CK(cudaMemcpy(c.npend, c.npend + 1, 4, cudaMemcpyDeviceToDevice));
                 pend_left = VERIF_FRAMES;
             }
@@ -785,15 +839,16 @@ struct Runner {
                 tm->swap += a; tm->trace += b; tm->decide += d; tm->update += u; tm->frames++;
             }
             if (rec_sum && (int)f >= rec_f0 && (int)f < rec_f0 + rec_nf)
-                k_accum_est<<<G, B>>>(c, S.Np, rec_sum + (size_t)(f - rec_f0) * S.Np, rec_sq + (size_t)(f - rec_f0) * S.Np, dormant);
+                (k_accum_est<<<G, B>>>(c, S.Np, rec_sum + (size_t)(f - rec_f0) * S.Np, rec_sq + (size_t)(f - rec_f0) * S.Np, dormant), DBG_K("k_accum_est"));
             if (want_err && S.has_ref) {
                 CK(cudaMemset(c.err, 0, 24));
-                k_error<<<G, B>>>(c, S.Np, st.ref, st.valid, dormant);
+                (k_error<<<G, B>>>(c, S.Np, st.ref, st.valid, dormant), DBG_K("k_error"));
                 double h[3]; CK(cudaMemcpy(h, c.err, 24, cudaMemcpyDeviceToHost));
                 errs.push_back(float(sqrt(h[0] / h[2]) / (h[1] / h[2])));
             }
         }
         CK(cudaGetLastError());
+        DBG("run termine : \"%s\"", M.name.c_str());
         for (auto& e : ev) cudaEventDestroy(e);
         return errs;
     }
@@ -1025,31 +1080,31 @@ static void run_taa_mode(Scene& S, const char* scen_file, int nseeds) {
                 for (size_t f = 0; f < seq.size(); ++f) {
                     int si = seq[f]; DevState& st = S.st[si];
                     if (deps && f % 32 == 0) { std::swap(t.cur, t.prev); CK(cudaMemset(t.cur, 0, NW * Np * 4)); }
-                    if (deps) k_taa_pt<true><<<G, B, shm>>>(st, t, S.Np, 5000 + sd, (uint32_t)f, S.dA);
-                    else k_taa_pt<false><<<G, B, shm>>>(st, t, S.Np, 5000 + sd, (uint32_t)f, S.dA);
+                    if (deps) (k_taa_pt<true><<<G, B, shm>>>(st, t, S.Np, 5000 + sd, (uint32_t)f, S.dA), DBG_K("k_taa_pt"));
+                    else (k_taa_pt<false><<<G, B, shm>>>(st, t, S.Np, 5000 + sd, (uint32_t)f, S.dA), DBG_K("k_taa_pt"));
                     if (f > 0 && seq[f - 1] != si) {
                         int pe = seq[f - 1] * S.NS + si;
-                        if (m.mask == 2) k_taa_touch<<<G, B>>>(t, S.Np, dV[pe], nV[pe], RF, 0);
-                        if (m.mask == 3) { k_taa_touch<<<G, B>>>(t, S.Np, dV[pe], nV[pe], RF, 1); verify_left = 2; CK(cudaMemset(t.rs, 0, 3 * S.NR * 4)); CK(cudaMemset(cnt, 0, S.NR * 4)); }
-                        if (m.mask == 4) k_taa_oracle<<<G, B>>>(t, S.Np, S.st[seq[f - 1]].ref, st.ref, RF);
+                        if (m.mask == 2) (k_taa_touch<<<G, B>>>(t, S.Np, dV[pe], nV[pe], RF, 0), DBG_K("k_taa_touch"));
+                        if (m.mask == 3) { (k_taa_touch<<<G, B>>>(t, S.Np, dV[pe], nV[pe], RF, 1), DBG_K("k_taa_touch")); verify_left = 2; CK(cudaMemset(t.rs, 0, 3 * S.NR * 4)); CK(cudaMemset(cnt, 0, S.NR * 4)); }
+                        if (m.mask == 4) (k_taa_oracle<<<G, B>>>(t, S.Np, S.st[seq[f - 1]].ref, st.ref, RF), DBG_K("k_taa_oracle"));
                     }
                     if (m.mask == 1) {   // detection aveugle a chaque image
                         CK(cudaMemset(t.rs, 0, 3 * S.NR * 4)); CK(cudaMemset(cnt, 0, S.NR * 4));
-                        k_taa_zone_acc<<<G, B>>>(t, S.Np, S.dRegion, 0); k_count_zone<<<G, B>>>(S.Np, S.dRegion, t.pend, 0, cnt);
-                        k_taa_zone_decide<<<G, B>>>(t, S.Np, S.dRegion, cnt, 0, RF, 0);
+                        (k_taa_zone_acc<<<G, B>>>(t, S.Np, S.dRegion, 0), DBG_K("k_taa_zone_acc")); (k_count_zone<<<G, B>>>(S.Np, S.dRegion, t.pend, 0, cnt), DBG_K("k_count_zone"));
+                        (k_taa_zone_decide<<<G, B>>>(t, S.Np, S.dRegion, cnt, 0, RF, 0), DBG_K("k_taa_zone_decide"));
                     }
                     if (m.mask == 3 && verify_left > 0) {   // verification : changement reel sur les pixels signales ?
-                        k_taa_zone_acc<<<G, B>>>(t, S.Np, S.dRegion, 1);
-                        k_count_zone<<<G, B>>>(S.Np, S.dRegion, t.pend, 1, cnt);   // compte cumule sur les images de verification
+                        (k_taa_zone_acc<<<G, B>>>(t, S.Np, S.dRegion, 1), DBG_K("k_taa_zone_acc"));
+                        (k_count_zone<<<G, B>>>(S.Np, S.dRegion, t.pend, 1, cnt), DBG_K("k_count_zone"));   // compte cumule sur les images de verification
                         if (--verify_left == 0) {
-                            k_taa_zone_decide<<<G, B>>>(t, S.Np, S.dRegion, cnt, 1, RF, 1);
+                            (k_taa_zone_decide<<<G, B>>>(t, S.Np, S.dRegion, cnt, 1, RF, 1), DBG_K("k_taa_zone_decide"));
                         }
                     }
-                    k_taa_stats<<<G, B>>>(t, S.Np);
-                    k_taa_update<<<G, B>>>(t, S.Np, m.alpha, ALPHA_R, m.gamma);
+                    (k_taa_stats<<<G, B>>>(t, S.Np), DBG_K("k_taa_stats"));
+                    (k_taa_update<<<G, B>>>(t, S.Np, m.alpha, ALPHA_R, m.gamma), DBG_K("k_taa_update"));
                     std::swap(t.H, t.H2);
                     CK(cudaMemset(t.err, 0, 24));
-                    k_taa_err<<<G, B>>>(t, S.Np, st.ref, st.valid);
+                    (k_taa_err<<<G, B>>>(t, S.Np, st.ref, st.valid), DBG_K("k_taa_err"));
                     double h[3]; CK(cudaMemcpy(h, t.err, 24, cudaMemcpyDeviceToHost));
                     double e = sqrt(h[0] / h[2]) / (h[1] / h[2]);
                     curve[f] += e / nseeds;
@@ -1067,6 +1122,20 @@ static void run_taa_mode(Scene& S, const char* scen_file, int nseeds) {
 int main(int argc, char** argv) {
     if (argc < 3) { fprintf(stderr, "usage\n"); return 1; }
     std::string mode = argv[1];
+    if (const char* d = getenv("BENCH_DEBUG")) g_debug = atoi(d);
+    if (g_debug) {
+        int drv = 0, rt = 0, dev = 0; cudaDriverGetVersion(&drv); cudaRuntimeGetVersion(&rt); cudaGetDevice(&dev);
+        cudaDeviceProp pr; cudaGetDeviceProperties(&pr, dev);
+        DBG("mode %s, scene %s, BENCH_DEBUG=%d, NVTX %s", argv[1], argv[2], g_debug,
+#ifdef HAVE_NVTX
+            "actif");
+#else
+            "absent (en-tete nvtx3 introuvable)");
+#endif
+        DBG("GPU %s, architecture %d.%d, %d SM, %.0f Mo, pilote CUDA %d, runtime CUDA %d, masque %d bits, %d lampes",
+            pr.name, pr.major, pr.minor, pr.multiProcessorCount, pr.totalGlobalMem / 1048576.0, drv, rt, NV, NL);
+    }
+    NvtxScope nvtx_main(argv[1]);
     if (mode == "res") CK(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));   // attente passive : CPU = vrai travail hote
     CK(cudaFree(0));
     double v0 = vram_used_mb(), r0 = ram_mb();
@@ -1318,5 +1387,6 @@ int main(int argc, char** argv) {
             fflush(stdout);
         }
     }
+    DBG_SUMMARY();
     return 0;
 }

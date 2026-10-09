@@ -1,6 +1,7 @@
 # Bench : lumière fantôme des caches de radiance (SHaRC, NRC, DLSS)
 
-> **English summary at the end.**
+> **Tu es sous Linux ? Suis directement [LINUX.md](LINUX.md)** (étapes détaillées, traces de débogage NVIDIA NVTX).
+> **On Linux? Go straight to [LINUX.md](LINUX.md).** English summary at the end.
 
 Ce dépôt mesure un défaut des caches de lumière de NVIDIA (**SHaRC** et **NRC**, SDK RTXGI 2.0) : quand l'éclairage change (nuit qui tombe, lampe éteinte, gros objet déplacé), le cache garde l'ancienne lumière pendant plusieurs secondes. Il compare ces caches avec et sans des « briques » correctrices (vidage du cache, instantanés compacts par état, contournement), jusqu'à l'image finale avec DLSS.
 
@@ -99,6 +100,8 @@ Ils sont dans `reference/sdk_rtx4060/`. Par exemple, sur l'image finale avec DLS
 
 ## Banc B : CUDA (Linux et Windows)
 
+**Sous Linux, le mode d'emploi détaillé étape par étape est dans [LINUX.md](LINUX.md).**
+
 ### Prérequis
 
 - **CUDA Toolkit ≥ 12.8** (obligatoire pour les RTX 50 / Blackwell).
@@ -116,17 +119,21 @@ Ils sont dans `reference/sdk_rtx4060/`. Par exemple, sur l'image finale avec DLS
 
 Sous Windows, dans une invite de commandes classique : `cuda\build_windows.bat`.
 
-**2. Vérification rapide** (une graine), puis le banc complet :
+**2. Vérification rapide** (une graine), traces de débogage (`--debug` : vérification de chaque noyau CUDA, plages NVTX pour Nsight Systems, compute-sanitizer), puis le banc complet :
 
 ```bash
 ./cuda/run_cuda.sh --test
 ```
 
 ```bash
+./cuda/run_cuda.sh --debug
+```
+
+```bash
 ./cuda/run_cuda.sh
 ```
 
-**3. Renvoyer les résultats** : le dossier `results/cuda/` (fichiers `.jsonl`, `systeme_cuda.txt` et `RESULTATS_CUDA.md`).
+**3. Renvoyer les résultats** : `./cuda/run_cuda.sh --pack` crée une archive `.tar.gz` à envoyer.
 
 ### Ce qui est mesuré
 
@@ -162,7 +169,7 @@ This repo benchmarks "ghost lighting" in NVIDIA's radiance caches (SHaRC and NRC
   - Then `./windows/run.sh` (full, ~6–8 h on an RTX 5080) or `./windows/run.sh --rapide` (~2 h).
   - Finally `./windows/pack.sh`, and send back the resulting zip.
   - Prerequisites: VS 2022 with C++ and the Windows SDK, CMake ≥ 3.24, Git for Windows + Git LFS, Vulkan SDK, Python + numpy, a recent NVIDIA driver (≥ 572 for RTX 50), ~30 GB free disk. Do not use the PC or minimise the render window during the runs.
-- **Bench B (Linux and Windows, CUDA)**: `./cuda/build.sh` (CUDA ≥ 12.8), then `./cuda/run_cuda.sh`, then send back `results/cuda/`.
+- **Bench B (Linux and Windows, CUDA)**: see **[LINUX.md](LINUX.md)**. `./cuda/build.sh` (CUDA ≥ 12.8), `./cuda/run_cuda.sh --test`, `--debug` (NVTX / kernel-checked traces), then `./cuda/run_cuda.sh` and `./cuda/run_cuda.sh --pack`.
 - Reference results for an RTX 4060 are in `reference/`.
 
 ## Licences
