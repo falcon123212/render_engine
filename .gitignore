@@ -1,9 +1,0 @@
-/build/
-/external/
-/data/
-*.pyc
-__pycache__/
-
-# Personnages et archives (licence Mixamo : pas de redistribution)
-/*.fbx
-/*.zip
