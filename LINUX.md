@@ -9,8 +9,8 @@ Sous Linux, on lance le **bench CUDA** (dossier `cuda/`). Il compare le « cache
 Le bench SHaRC / NRC officiel de NVIDIA (dossier `windows/`) ne tourne **pas** sous Linux : NVIDIA ne fournit NRC qu'en DLL Windows. Tu peux ignorer ce dossier.
 *The official NVIDIA SHaRC / NRC bench (`windows/`) does **not** run on Linux: NRC ships as Windows DLLs only. Ignore that folder.*
 
-> **Tu as déjà fait le bench une première fois ?** Va directement à la section [« Mise à jour du 9 octobre 2026 »](#mise-à-jour-du-9-octobre-2026--update-2026-10-09) en bas : il y a deux choses nouvelles à lancer (~10 min en tout).
-> *Already ran the bench once? Jump to the "Update 2026-10-09" section at the bottom: two new things to run (~10 min total).*
+> **Tu as déjà fait le bench une première fois ?** Va directement à la section [« Mise à jour du 9 octobre 2026 »](#mise-à-jour-du-9-octobre-2026--update-2026-10-09) en bas. Nouveau : le bench tourne maintenant sur les **scènes publiques de NVIDIA** (Sponza, Bistro…), section C.
+> *Already ran the bench once? Jump to the "Update 2026-10-09" section at the bottom. New: the bench now runs on **NVIDIA's public scenes** (Sponza, Bistro…), section C.*
 
 ---
 
@@ -208,8 +208,8 @@ Le mode débogage synchronise le GPU après chaque noyau : **ses temps ne sont p
 
 ## Mise à jour du 9 octobre 2026 / Update 2026-10-09
 
-Deux nouveautés. Commence par récupérer la dernière version du dépôt :
-*Two new things. First, get the latest version of the repo:*
+Trois nouveautés. Commence par récupérer la dernière version du dépôt (le bench se recompile tout seul au lancement suivant) :
+*Three new things. First, get the latest version of the repo (the bench rebuilds itself on the next run):*
 
 ```bash
 cd render_engine
@@ -239,8 +239,8 @@ Puis renvoie les résultats comme d'habitude (étape 8) :
 
 ### B. Télécharger les scènes publiques de NVIDIA (~100 Mo, 1 à 2 min ; Bistro : +2,3 Go)
 
-La prochaine version du bench testera la méthode sur des scènes **publiques** que tout le monde connaît, et plus seulement sur nos scènes en boîtes. Ce sont les scènes du dépôt officiel de NVIDIA [RTXGI-Assets](https://github.com/NVIDIAGameWorks/RTXGI-Assets), celles que NVIDIA utilise pour ses démos SHaRC et RTXGI. Elles sont au format glTF, sans Git LFS ni compte à créer.
-*The next bench version will test on well-known **public** scenes from NVIDIA's official RTXGI-Assets repo (glTF, no Git LFS, no account).*
+Le bench teste maintenant la méthode sur des scènes **publiques** que tout le monde connaît, et plus seulement sur nos scènes en boîtes. Ce sont les scènes du dépôt officiel de NVIDIA [RTXGI-Assets](https://github.com/NVIDIAGameWorks/RTXGI-Assets), celles que NVIDIA utilise pour ses démos SHaRC et RTXGI. Elles sont au format glTF, sans Git LFS ni compte à créer.
+*The bench now tests on well-known **public** scenes from NVIDIA's official RTXGI-Assets repo (glTF, no Git LFS, no account).*
 
 | Scène | Taille | Intérêt |
 |---|---|---|
@@ -265,8 +265,54 @@ La prochaine version du bench testera la méthode sur des scènes **publiques** 
 **Attendu / expected** : une ligne `OK` par scène, avec sa taille et le chemin de son fichier `.gltf`, puis `fini / done`. Les scènes vont dans `scenes_publiques/RTXGI-Assets/`, qui n'est pas versionné. En cas de coupure, relance la même commande.
 *One `OK` line per scene, then `fini / done`. If interrupted, rerun the same command.*
 
-**Important :** le bench ne sait **pas encore** lire ces scènes. Le convertisseur glTF et le traceur adapté aux grandes scènes arrivent dans une prochaine mise à jour. Ce téléchargement sert seulement à les avoir prêtes. Il n'y a rien à mesurer ni à renvoyer pour cette partie.
-*The bench **cannot read these scenes yet**: the glTF converter and large-scene tracer come in a later update. This only gets them ready; nothing to measure or send back for this part.*
-
 Licences : chaque scène vient directement de NVIDIA et garde sa licence (Bistro : CC-BY 4.0, Amazon Lumberyard ; Sponza : voir `Sponza/README.md`). Ce dépôt ne les redistribue pas.
 *Licences: scenes come straight from NVIDIA with their own licences; this repo does not redistribute them.*
+
+### C. Le bench sur les scènes publiques (~5 min de test, puis ~30 à 60 min)
+
+Il faut **numpy** pour convertir les scènes glTF :
+*The glTF converter needs **numpy**:*
+
+```bash
+sudo apt install -y python3-numpy
+```
+
+**1. Test rapide** (CornellBox + Sponza, 1 graine, ~5 min). Il vérifie que tout s'enchaîne. Les chiffres ne sont **pas** significatifs.
+*Quick check (CornellBox + Sponza, 1 seed, ~5 min). Numbers are not meaningful.*
+
+```bash
+./cuda/run_cuda.sh --publiques-test
+```
+
+**Attendu / expected** : pour chaque scène, `conversion`, `preparation`, `timing_pub_<scène>.jsonl`, une ligne `budget des baselines ... = 1.xx x`, `scen_pub_<scène>.jsonl`, puis `fini / done : ../results/cuda_test/RESULTATS_CUDA.md`.
+
+**2. Le bench complet** sur toutes les scènes téléchargées (10 graines). Bistro est incluse si tu l'as téléchargée (`--bistro` à l'étape B).
+*Full bench on every downloaded scene (10 seeds). Bistro is included if downloaded.*
+
+```bash
+./cuda/run_cuda.sh --publiques
+```
+
+**3. Renvoyer** les résultats (étape 8) :
+*Send the results back (step 8):*
+
+```bash
+./cuda/run_cuda.sh --pack
+```
+
+**Ce qui se passe pour chaque scène / What happens for each scene**
+
+1. **Conversion** du glTF en maillage : tous les triangles, en mètres, avec un albédo par matériau. Les textures ne sont pas lues, et les vitres transparentes sont retirées.
+2. **Préparation**, une seule fois par scène, gardée dans `scenes_publiques/cache/` :
+   - un BVH, la structure qui accélère les rayons ;
+   - environ 300 000 points de cache posés sur une grille de hachage, comme SHaRC ;
+   - **3 lampes et un cube mobile placés automatiquement** dans les espaces libres ;
+   - une **référence convergée** pour chacun des 5 états, avec un bruit propre d'environ 3 % (un peu plus sur Bistro).
+   Compte de quelques secondes (CornellBox) à environ 10 minutes (Bistro, 4 M de triangles). Si c'est interrompu, relance : ce qui est fini est gardé.
+3. **Temps GPU par image** des méthodes sur cette scène. Il donne le **budget « à temps égal »** des baselines **sur ce GPU et cette scène**. Sur Sponza avec une RTX 4060, la v4 coûte +16 %, et les baselines reçoivent donc ×1,2 de rayons.
+4. **Six scénarios** : lampe éteinte puis rallumée, lampe éteinte avec le cube déplacé dans le noir, cube déplacé puis remis, lampe éteinte, cube déplacé, nouvelle lampe allumée. Il y a **8 rayons par point et par image**, et les historiques comptent en images, comme SHaRC.
+
+*Per scene: glTF conversion → one-time preparation (BVH, ~300 k hash-grid cache points like SHaRC, 3 lights and a moving cube placed automatically, converged references with ~3 % self-noise; cached in `scenes_publiques/cache/`) → GPU time per frame, which sets the equal-time baseline budget for this GPU and scene → six event scenarios at 8 rays per point per frame.*
+
+**Si ça plante / If it fails** : le journal de préparation est dans `scenes_publiques/cache/<scène>.prep.log`. Envoie l'archive de l'étape 8 : elle contient ces journaux. Pour refaire la préparation d'une scène, supprime `scenes_publiques/cache/<scène>.bin`.
+*Preparation logs: `scenes_publiques/cache/<scene>.prep.log` (included in the step 8 archive). To redo a scene's preparation, delete its `.bin` in `scenes_publiques/cache/`.*

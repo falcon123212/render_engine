@@ -2,6 +2,10 @@
 // POC GPU : cache de lumiere a dependances (v3) vs accumulation classique, sur RTX.
 //   poc_gpu timing  <scene.bin>
 //   poc_gpu quality <scene.bin> <nseeds> <budget1,budget2,...>
+//   poc_gpu scenf   <scene.bin> <nseeds> <scenarios.txt> [budget des baselines]
+//   poc_gpu prep    <maillage.mesh> <scene.bin> [points]     (scenes publiques : voir prep_mesh.cuh)
+// Scenes : format 2 = boites (exportees par Python), format 3 = maillages (BVH + grille de hachage des points de cache).
+// BENCH_RAYONS=r : r rayons par point et par image, historiques en images (scenes publiques : 8).
 // Sortie : lignes JSON sur stdout.
 #include <cstdio>
 #include <cstdint>
@@ -60,6 +64,9 @@ static inline int nvtxRangePop() { return 0; }
 static inline void nvtxMarkA(const char*) {}
 #endif
 static int g_debug = 0;
+// BENCH_RAYONS : rayons par point de cache et par image (1 par defaut ; scenes publiques : 4, voir run_cuda.sh).
+// Multiplie le budget de TOUTES les methodes : les comparaisons a temps egal sont inchangees.
+static float g_rays = 1.f;
 static std::map<std::string, long long>& kcount() { static std::map<std::string, long long> m; return m; }
 static void DBG(const char* fmt, ...) {
     if (!g_debug) return;
@@ -100,7 +107,11 @@ constexpr int FX = 16, FY = 8, FZ = 6;   // grille fine des voxels d'evenement e
 #define NLIGHTS 3
 #endif
 constexpr int NL = NLIGHTS;
-constexpr float X1 = 8.f, Y1 = 4.f, Z1 = 3.f;
+constexpr float X1 = 8.f, Y1 = 4.f, Z1 = 3.f;   // bornes des scenes en boites (format 2)
+// Bornes de la grille de transit : (0,0,0)-(8,4,3) pour les scenes en boites, boite englobante pour les maillages (format 3)
+__constant__ float c_lo[3] = {0.f, 0.f, 0.f};
+__constant__ float c_ext[3] = {X1, Y1, Z1};
+static float g_lo[3] = {0.f, 0.f, 0.f}, g_ext[3] = {X1, Y1, Z1};
 constexpr int VERIF_FRAMES = 4;
 
 // ------------------------------------------------------------------ outils device
@@ -124,15 +135,16 @@ __device__ __forceinline__ float rnd(uint32_t& s) {
 }
 
 __device__ __forceinline__ int vox_of(f3 p) {
-    int i = min(max(int(p.x / X1 * VX), 0), VX - 1);
-    int j = min(max(int(p.y / Y1 * VY), 0), VY - 1);
-    int k = min(max(int(p.z / Z1 * VZ), 0), VZ - 1);
+    int i = min(max(int((p.x - c_lo[0]) / c_ext[0] * VX), 0), VX - 1);
+    int j = min(max(int((p.y - c_lo[1]) / c_ext[1] * VY), 0), VY - 1);
+    int k = min(max(int((p.z - c_lo[2]) / c_ext[2] * VZ), 0), VZ - 1);
     return (k * VY + j) * VX + i;
 }
 // parcours DDA (Amanatides-Woo) : uniquement les voxels traverses ; masque en memoire partagee
 __device__ __forceinline__ void dda_seg(f3 a, f3 b, uint32_t* sm, int stride) {
-    const float sx = VX / X1, sy = VY / Y1, sz = VZ / Z1;
-    float ax = a.x * sx, ay = a.y * sy, az = a.z * sz, bx = b.x * sx, by = b.y * sy, bz = b.z * sz;
+    const float sx = VX / c_ext[0], sy = VY / c_ext[1], sz = VZ / c_ext[2];
+    float ax = (a.x - c_lo[0]) * sx, ay = (a.y - c_lo[1]) * sy, az = (a.z - c_lo[2]) * sz;
+    float bx = (b.x - c_lo[0]) * sx, by = (b.y - c_lo[1]) * sy, bz = (b.z - c_lo[2]) * sz;
     int ix = min(max(int(ax), 0), VX - 1), iy = min(max(int(ay), 0), VY - 1), iz = min(max(int(az), 0), VZ - 1);
     int ex = min(max(int(bx), 0), VX - 1), ey = min(max(int(by), 0), VY - 1), ez = min(max(int(bz), 0), VZ - 1);
     float dx = bx - ax, dy = by - ay, dz = bz - az;
@@ -157,8 +169,9 @@ __device__ __forceinline__ void set_bit_reg(uint32_t (&m)[NW], int v) {
     for (int w = 0; w < NW; ++w) m[w] |= (w == w0) ? bit : 0u;
 }
 __device__ __forceinline__ void dda_reg(f3 a, f3 b, uint32_t (&m)[NW]) {
-    const float sx = VX / X1, sy = VY / Y1, sz = VZ / Z1;
-    float ax = a.x * sx, ay = a.y * sy, az = a.z * sz, bx = b.x * sx, by = b.y * sy, bz = b.z * sz;
+    const float sx = VX / c_ext[0], sy = VY / c_ext[1], sz = VZ / c_ext[2];
+    float ax = (a.x - c_lo[0]) * sx, ay = (a.y - c_lo[1]) * sy, az = (a.z - c_lo[2]) * sz;
+    float bx = (b.x - c_lo[0]) * sx, by = (b.y - c_lo[1]) * sy, bz = (b.z - c_lo[2]) * sz;
     int ix = min(max(int(ax), 0), VX - 1), iy = min(max(int(ay), 0), VY - 1), iz = min(max(int(az), 0), VZ - 1);
     int ex = min(max(int(bx), 0), VX - 1), ey = min(max(int(by), 0), VY - 1), ez = min(max(int(bz), 0), VZ - 1);
     float dx = bx - ax, dy = by - ay, dz = bz - az;
@@ -213,6 +226,14 @@ struct DevState {
     uint8_t* valid;
     float inten[NL];
     int nt;
+    // Maillages (format 3) : geometrie statique dans un BVH, points de cache retrouves par table de hachage spatiale
+    const float* ST;                  // triangles statiques : v0, e1, e2 (9 flottants)
+    const float4* STN;                // normale geometrique + drapeaux (w : bit 0 = double face)
+    const float4* BN;                 // noeuds du BVH (2 float4 : bmin + gauche/premier, bmax + nombre)
+    const unsigned long long* HK;     // cles de la table de hachage (0 = vide)
+    const int* HV;                    // point de cache associe
+    unsigned hmask;                   // taille de la table - 1
+    float hcell;                      // taille d'une cellule de cache (m)
 };
 
 __device__ __forceinline__ int point_index(f3 H, int q, const DevState& s) {
@@ -222,6 +243,118 @@ __device__ __forceinline__ int point_index(f3 H, int q, const DevState& s) {
     int nu = s.dims[2 * q], nv = s.dims[2 * q + 1];
     int iu = min(max(int(a * nu), 0), nu - 1), iv = min(max(int(b * nv), 0), nv - 1);
     return s.off[q] + iv * nu + iu;
+}
+
+// ---------------------------------------------------------------- maillages (format 3)
+// Cle d'une cellule de cache : cellule de cote hcell + direction dominante de la normale (6 seaux), comme la grille de
+// hachage de SHaRC. Partagee hote / GPU.
+__host__ __device__ __forceinline__ int normal_bucket(float nx, float ny, float nz) {
+    float ax = fabsf(nx), ay = fabsf(ny), az = fabsf(nz);
+    if (ax >= ay && ax >= az) return nx > 0.f ? 0 : 1;
+    if (ay >= az) return ny > 0.f ? 2 : 3;
+    return nz > 0.f ? 4 : 5;
+}
+__host__ __device__ __forceinline__ unsigned long long cell_key(int cx, int cy, int cz, int b) {
+    return ((((unsigned long long)(cx & 0xFFFFF) << 20 | (unsigned long long)(cy & 0xFFFFF)) << 20 | (unsigned long long)(cz & 0xFFFFF)) << 3 | (unsigned long long)b) + 1ull;
+}
+__host__ __device__ __forceinline__ unsigned long long mix64(unsigned long long x) {
+    x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ull; x ^= x >> 27; x *= 0x94d049bb133111ebull; x ^= x >> 31; return x;
+}
+__device__ __forceinline__ int hash_find(const DevState& s, unsigned long long key) {
+    unsigned h = (unsigned)mix64(key) & s.hmask;
+    for (int probe = 0; probe < 64; ++probe) {
+        unsigned long long k = __ldg(s.HK + h);
+        if (k == key) return __ldg(s.HV + h);
+        if (k == 0ull) return -1;
+        h = (h + 1) & s.hmask;
+    }
+    return -1;
+}
+// point de cache d'un impact H sur une surface de normale n (cote touche) ; -1 si aucun (rare : cellule non echantillonnee)
+__device__ int hash_point(const DevState& s, f3 H, f3 n) {
+    int b = normal_bucket(n.x, n.y, n.z);
+    float ih = 1.f / s.hcell;
+    int cx = (int)floorf((H.x - c_lo[0]) * ih), cy = (int)floorf((H.y - c_lo[1]) * ih), cz = (int)floorf((H.z - c_lo[2]) * ih);
+    int p = hash_find(s, cell_key(cx, cy, cz, b));
+    if (p >= 0) return p;
+    for (int d = 0; d < 27; ++d) {   // voisins (impact au bord d'une cellule)
+        int dz = d / 9 - 1, dy = (d / 3) % 3 - 1, dx = d % 3 - 1;
+        if (dx == 0 && dy == 0 && dz == 0) continue;
+        p = hash_find(s, cell_key(cx + dx, cy + dy, cz + dz, b));
+        if (p >= 0) return p;
+    }
+    return -1;
+}
+__device__ __forceinline__ float aabb_enter(float4 a, float4 b, f3 o, f3 inv, float tmax) {
+    float tx1 = (a.x - o.x) * inv.x, tx2 = (b.x - o.x) * inv.x;
+    float ty1 = (a.y - o.y) * inv.y, ty2 = (b.y - o.y) * inv.y;
+    float tz1 = (a.z - o.z) * inv.z, tz2 = (b.z - o.z) * inv.z;
+    float tn = fmaxf(fmaxf(fminf(tx1, tx2), fminf(ty1, ty2)), fmaxf(fminf(tz1, tz2), 0.f));
+    float tf = fminf(fminf(fmaxf(tx1, tx2), fmaxf(ty1, ty2)), fminf(fmaxf(tz1, tz2), tmax));
+    return tn <= tf ? tn : 1e30f;
+}
+// parcours du BVH statique (pile, enfant le plus proche d'abord) ; q = -2 - indice du triangle statique touche
+__device__ void trace_bvh(f3 o, f3 d, const DevState& s, float& tmin, int& q) {
+    f3 inv = mk(fabsf(d.x) > 1e-12f ? 1.f / d.x : copysignf(1e30f, d.x),
+                fabsf(d.y) > 1e-12f ? 1.f / d.y : copysignf(1e30f, d.y),
+                fabsf(d.z) > 1e-12f ? 1.f / d.z : copysignf(1e30f, d.z));
+    int stack[64]; int sp = 0, node = 0;
+    while (true) {
+        float4 a = __ldg(s.BN + 2 * node), b = __ldg(s.BN + 2 * node + 1);
+        int lf = __float_as_int(a.w), cnt = __float_as_int(b.w);
+        if (cnt > 0) {
+            for (int j = lf; j < lf + cnt; ++j) {
+                const float* T = s.ST + 9 * (size_t)j;
+                f3 v0 = mk(__ldg(T), __ldg(T + 1), __ldg(T + 2));
+                f3 e1 = mk(__ldg(T + 3), __ldg(T + 4), __ldg(T + 5));
+                f3 e2 = mk(__ldg(T + 6), __ldg(T + 7), __ldg(T + 8));
+                f3 p = cross(d, e2);
+                float det = dot(e1, p);
+                if (fabsf(det) <= 1e-12f) continue;
+                float iv = 1.f / det;
+                f3 tv = o - v0;
+                float u = dot(tv, p) * iv;
+                if (u < 0.f || u > 1.f) continue;
+                f3 qv = cross(tv, e1);
+                float v = dot(d, qv) * iv;
+                if (v < 0.f || u + v > 1.f) continue;
+                float t = dot(e2, qv) * iv;
+                if (t > 1e-4f && t < tmin) { tmin = t; q = -2 - j; }
+            }
+        } else {
+            float4 la = __ldg(s.BN + 2 * lf), lb = __ldg(s.BN + 2 * lf + 1);
+            float4 ra = __ldg(s.BN + 2 * lf + 2), rb = __ldg(s.BN + 2 * lf + 3);
+            float tl = aabb_enter(la, lb, o, inv, tmin), tr = aabb_enter(ra, rb, o, inv, tmin);
+            int first = lf, second = lf + 1;
+            if (tr < tl) { float x = tl; tl = tr; tr = x; first = lf + 1; second = lf; }
+            if (tl < 1e30f) {
+                if (tr < 1e30f && sp < 64) stack[sp++] = second;
+                node = first; continue;
+            }
+        }
+        if (sp == 0) break;
+        node = stack[--sp];
+    }
+}
+// rayon complet : triangles dynamiques (memoire partagee) puis BVH statique s'il existe
+__device__ __forceinline__ bool trace_full(f3 o, f3 d, const float* T, const int* TQ, const DevState& s, float& tmin, int& q) {
+    bool h = trace(o, d, T, TQ, s.nt, tmin, q);
+    if (s.BN) { trace_bvh(o, d, s, tmin, q); h = q != -1; }
+    return h;
+}
+// point de cache touche (pi) ; renvoie vrai si l'impact ne compte pas (rien touche, face arriere, cellule absente)
+__device__ __forceinline__ bool resolve_hit(const DevState& s, bool hit, f3 H, f3 D, int q, int i, int& pi) {
+    if (!hit) { pi = i; return true; }
+    if (q >= 0) { pi = point_index(H, q, s); return dot(ld3(s.Q + 12 * q, 3), D) > 0.f; }
+    float4 n4 = __ldg(s.STN + (-2 - q));
+    f3 n = mk(n4.x, n4.y, n4.z);
+    if (dot(n, D) > 0.f) {
+        if (!(__float_as_int(n4.w) & 1)) { pi = i; return true; }   // face arriere d'une surface simple face
+        n = n * -1.f;
+    }
+    pi = hash_point(s, H, n);
+    if (pi < 0) { pi = i; return true; }
+    return false;
 }
 
 __device__ __forceinline__ f3 cosine_dir(f3 N, float u1, float u2) {
@@ -248,7 +381,7 @@ __global__ void k_build(DevState s, const float* L, int Np) {
         float r = sqrtf(dot(d, d));
         f3 D = d * (1.f / r);
         float c = dot(N, D), t; int q;
-        trace(O, D, sh, shq, s.nt, t, q);
+        trace_full(O, D, sh, shq, s, t, q);
         bool vis = t >= r - 1e-3f;
         float rr = fmaxf(r, 0.05f);
         s.Edir[NL * i + l] = s.inten[l] * fmaxf(c, 0.f) / (rr * rr) * (vis ? 1.f : 0.f);
@@ -285,6 +418,7 @@ struct Params {
     int dormant;        // v4-A : bit l = lampe l en sommeil (canal gele, exclu du rendu)
     int ramp;           // v4-C : plafond d'historique apres reinitialisation
     int proj_left, projK; int slot[6];   // v5-B : fenetre de projection et instantanes utilises
+    float rays;         // rayons par point et par image (BENCH_RAYONS)
 };
 constexpr int KSNAP = 6, NEQ = 28;      // 6 instantanes max ; 21 (matrice) + 6 (second membre) + 1 (compte)
 constexpr int PROJ_FRAMES = 4;
@@ -314,7 +448,7 @@ __global__ void k_trace2(DevState s, Cache c, Params p, const int* region, const
     } else {
         float pr = 1.f / (c.n[i] + 1.f);
         float rrest = float(p.Np - c.npend[0]);
-        float e = rrest * (0.5f / p.Np + 0.5f * pr / c.sumpr[0]);
+        float e = rrest * (0.5f / p.Np + 0.5f * pr / c.sumpr[0]) * p.rays;
         float eb = floorf(e);
         k = (pend ? 1 : 0) + int(eb) + (rnd(rs) < e - eb ? 1 : 0);
     }
@@ -329,10 +463,10 @@ __global__ void k_trace2(DevState s, Cache c, Params p, const int* region, const
     for (int r = 0; r < k; ++r) {
         f3 D = cosine_dir(N, rnd(rs), rnd(rs));
         float t; int q;
-        bool hit = trace(O, D, sh, shq, s.nt, t, q);
+        bool hit = trace_full(O, D, sh, shq, s, t, q);
         f3 H = hit ? O + D * t : O;
-        bool back = !hit || dot(ld3(s.Q + 12 * q, 3), D) > 0.f;
-        int pi = hit ? point_index(H, q, s) : i;
+        int pi;
+        bool back = resolve_hit(s, hit, H, D, q, i, pi);
         float val = 0.f;
         if (!back) {
             float A = Alb[pi];
@@ -408,7 +542,7 @@ __global__ void k_decide(Cache c, Params p, const int* region) {
         float base = r4[2] / cnt;
         float rel = mean / base;
         if (fabsf(mean) > 2.f * se && fabsf(rel) > 0.03f) {
-            float tgt = fminf(fmaxf(0.5f / fabsf(rel), 1.f), p.nmax);
+            float tgt = fminf(fmaxf(0.5f / fabsf(rel), 1.f) * p.rays, p.nmax);
             c.n[i] = fminf(c.n[i], tgt);
             c.pending[i] = 0;
             done = true;
@@ -432,7 +566,7 @@ __global__ void k_update(Cache c, Params p, const int* region) {
         int k = c.kk[i];
         float n = c.n[i], nn = n + k;
         float nmx = p.nmax;
-        if (p.ramp) { float a = c.age[i]; nmx = fminf(p.nmax, 4.f + 0.5f * a); c.age[i] = fminf(a + 1.f, 1e4f); }
+        if (p.ramp) { float a = c.age[i]; nmx = fminf(p.nmax, (4.f + 0.5f * a) * p.rays); c.age[i] = fminf(a + 1.f, 1e4f); }
         float alpha = k > 0 ? fminf(k / fminf(fmaxf(nn, 1.f), nmx), 1.f) : 0.f;
         if (p.ddgi) {
             // DDGI (ProbeBlendingCS) : ecart mesure par zone (equivalent d'une sonde a nombreux rayons)
@@ -495,7 +629,7 @@ __global__ void k_proj_apply(Cache c, Params p, const int* region) {
         for (int a = 0; a < p.projK; ++a) v += cf[a] * c.snap[((size_t)p.slot[a] * p.Np + i) * NL + l];
         c.Lc[NL * i + l] = fmaxf(v, 0.f);
     }
-    c.n[i] = 8.f; c.age[i] = 8.f;
+    c.n[i] = 8.f * p.rays; c.age[i] = 8.f;
     c.pending[i] = 1; c.c0[i] = est_of(c, i, p.dormant);
     atomicAdd(&c.npend[1], 1);
 }
@@ -572,6 +706,17 @@ __global__ void k_accum_est(Cache c, int Np, float* sum, float* sq, int dormant)
 template <class T> T* dalloc(size_t n) { T* p; CK(cudaMalloc(&p, n * sizeof(T) + 16)); return p; }
 template <class T> T* dput(const std::vector<T>& v) { T* p = dalloc<T>(v.size()); CK(cudaMemcpy(p, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice)); return p; }
 
+static void set_bounds(const float lo[3], const float ext[3]) {
+    for (int a = 0; a < 3; ++a) { g_lo[a] = lo[a]; g_ext[a] = ext[a]; }
+    CK(cudaMemcpyToSymbol(c_lo, g_lo, sizeof g_lo)); CK(cudaMemcpyToSymbol(c_ext, g_ext, sizeof g_ext));
+}
+static int host_vox(const float* p) {   // voxel de la grille de transit (bornes courantes)
+    int i = std::min(std::max(int((p[0] - g_lo[0]) / g_ext[0] * VX), 0), VX - 1);
+    int j = std::min(std::max(int((p[1] - g_lo[1]) / g_ext[1] * VY), 0), VY - 1);
+    int k = std::min(std::max(int((p[2] - g_lo[2]) / g_ext[2] * VZ), 0), VZ - 1);
+    return (k * VY + j) * VX + i;
+}
+
 static std::vector<int> to_grid(const std::vector<int>& fine) {
     std::vector<char> mark(NV, 0);
     for (int v : fine) {
@@ -590,7 +735,7 @@ static std::vector<int> to_grid(const std::vector<int>& fine) {
 }
 
 struct Scene {
-    int Np, Nq, Nt, NS, nl, NR, has_ref;
+    int Np, Nq, Nt, NS, nl, NR, has_ref, fmt = 2;
     std::vector<int> hdims, hoff;
     std::vector<float> L, A;
     std::vector<int> region;
@@ -598,6 +743,7 @@ struct Scene {
     std::vector<std::vector<float>> inten;
     std::vector<std::vector<int>> occ, em;
     float *dL, *dA; int* dRegion;
+    int nst = 0, nnodes = 0, npst = 0; float hcell = 0.f;   // format 3
 };
 
 template <class T> void rd(FILE* f, std::vector<T>& v, size_t n) { v.resize(n); if (n && fread(v.data(), sizeof(T), n, f) != n) { fprintf(stderr, "lecture\n"); exit(1); } }
@@ -607,8 +753,21 @@ Scene load(const char* path) {
     if (!f) { fprintf(stderr, "fichier %s\n", path); exit(1); }
     int h[8]; fread(h, 4, 8, f);
     if (h[4] != NL) { fprintf(stderr, "scene a %d lampes, programme compile pour %d (-DNLIGHTS)\n", h[4], NL); exit(1); }
-    if (h[7] != 2) { fprintf(stderr, "format de scene %d non supporte (reexporter)\n", h[7]); exit(1); }
-    Scene S; S.Np = h[0]; S.Nq = h[1]; S.Nt = h[2]; S.NS = h[3]; S.nl = h[4]; S.NR = h[5]; S.has_ref = h[6];
+    if (h[7] != 2 && h[7] != 3) { fprintf(stderr, "format de scene %d non supporte (reexporter)\n", h[7]); exit(1); }
+    Scene S; S.Np = h[0]; S.Nq = h[1]; S.Nt = h[2]; S.NS = h[3]; S.nl = h[4]; S.NR = h[5]; S.has_ref = h[6]; S.fmt = h[7];
+    // format 3 (maillage) : bornes, geometrie statique + BVH, table de hachage des points de cache
+    const float *dST = nullptr; const float4 *dSTN = nullptr, *dBN = nullptr; const unsigned long long* dHK = nullptr; const int* dHV = nullptr;
+    unsigned hmask = 0; float hcell = 0.f;
+    if (S.fmt == 3) {
+        float lo[3], ext[3]; int m[4];
+        if (fread(lo, 4, 3, f) != 3 || fread(ext, 4, 3, f) != 3 || fread(&hcell, 4, 1, f) != 1 || fread(m, 4, 4, f) != 4) { fprintf(stderr, "lecture\n"); exit(1); }
+        std::vector<float> ST, STN, BN; std::vector<unsigned long long> HK; std::vector<int> HV;
+        rd(f, ST, 9 * (size_t)m[0]); rd(f, STN, 4 * (size_t)m[0]); rd(f, BN, 8 * (size_t)m[1]); rd(f, HK, (size_t)m[2]); rd(f, HV, (size_t)m[2]);
+        dST = dput(ST); dSTN = (const float4*)dput(STN); dBN = (const float4*)dput(BN); dHK = dput(HK); dHV = dput(HV);
+        hmask = (unsigned)m[2] - 1;
+        S.nst = m[0]; S.nnodes = m[1]; S.npst = m[3]; S.hcell = hcell;
+        set_bounds(lo, ext);
+    }
     rd(f, S.L, 3 * NL); rd(f, S.A, S.Np); rd(f, S.region, S.Np);
     for (int s = 0; s < S.NS; ++s) {
         std::vector<float> in, P, N, Q, T, ref, Pw; std::vector<int> dims, off, TQ; std::vector<uint8_t> valid;
@@ -620,15 +779,16 @@ Scene load(const char* path) {
         d.Edir = dalloc<float>(NL * (size_t)S.Np); d.SV = dalloc<uint32_t>(NW * (size_t)S.Np);
         for (int l = 0; l < NL; ++l) d.inten[l] = in[l];
         d.nt = S.Nt;
+        d.ST = dST; d.STN = dSTN; d.BN = dBN; d.HK = dHK; d.HV = dHV; d.hmask = hmask; d.hcell = hcell;
         if (S.hdims.empty()) { S.hdims = dims; S.hoff = off; }
         S.st.push_back(d); S.inten.push_back(in);
     }
     for (int e = 0; e < S.NS * S.NS; ++e) {
         int no; fread(&no, 4, 1, f);
-        std::vector<int> o; rd(f, o, no); S.occ.push_back(to_grid(o));
+        std::vector<int> o; rd(f, o, no); S.occ.push_back(S.fmt == 3 ? o : to_grid(o));   // format 3 : deja sur la grille de transit
         for (int l = 0; l < NL; ++l) {             // voxel de chaque lampe qui s'allume
             int ne; fread(&ne, 4, 1, f);
-            std::vector<int> m; rd(f, m, ne); S.em.push_back(to_grid(m));
+            std::vector<int> m; rd(f, m, ne); S.em.push_back(S.fmt == 3 ? m : to_grid(m));
         }
     }
     fclose(f);
@@ -671,15 +831,17 @@ struct Runner {
         // demarrage a chaud
         if (S.has_ref) CK(cudaMemcpy(c.Lc, S.st[s0].Pw, NL * Np * 4, cudaMemcpyDeviceToDevice));
         else CK(cudaMemset(c.Lc, 0, NL * Np * 4));
-        std::vector<float> nm(Np, M.nmax); CK(cudaMemcpy(c.n, nm.data(), Np * 4, cudaMemcpyHostToDevice));
+        const float nmax = M.nmax * g_rays;   // historique plafonne en images (x rayons par point)
+        std::vector<float> nm(Np, nmax); CK(cudaMemcpy(c.n, nm.data(), Np * 4, cudaMemcpyHostToDevice));
         CK(cudaMemset(c.pending, 0, Np)); CK(cudaMemset(c.cur, 0, NW * Np * 4)); CK(cudaMemset(c.prev, 0, NW * Np * 4));
         CK(cudaMemset(c.stale, 0, Np));
         { std::vector<float> ag(Np, 1e4f); CK(cudaMemcpy(c.age, ag.data(), Np * 4, cudaMemcpyHostToDevice)); }
         int dormant = 0; float ilearn[NL] = {0, 0, 0};
-        float sp[2] = {float(Np) / (M.nmax + 1.f), 0.f}; CK(cudaMemcpy(c.sumpr, sp, 8, cudaMemcpyHostToDevice));
+        float sp[2] = {float(Np) / (nmax + 1.f), 0.f}; CK(cudaMemcpy(c.sumpr, sp, 8, cudaMemcpyHostToDevice));
         int z2[2] = {0, 0}; CK(cudaMemcpy(c.npend, z2, 8, cudaMemcpyHostToDevice));
         Params p{S.Np, S.NR, M.mode, M.budget, M.nmax, seed, 0, 0, M.deps,
                  M.resp_mask, M.nmax_resp, M.ddgi ? 1 : 0, M.ddgi_h, M.ddgi_thr, M.ddgi_clamp ? 1 : 0, 0, M.ramp ? 1 : 0};
+        p.rays = g_rays; p.budget = M.budget * g_rays; p.nmax = nmax; p.nmax_resp = M.nmax_resp * g_rays;
         cudaEvent_t ev[6]; for (auto& e : ev) cudaEventCreate(&e);
         size_t shm = S.Nt * 10 * sizeof(float);
         std::vector<float> errs;
@@ -756,11 +918,11 @@ struct Runner {
                         if (M.snap_verify) {
                             CK(cudaMemset(c.npend, 0, 8));
                             CK(cudaMemset(c.rstat, 0, 4 * S.NR * 4));
-                            (k_restored<<<G, B>>>(c, S.Np, M.nmax, dormant, 1), DBG_K("k_restored"));
+                            (k_restored<<<G, B>>>(c, S.Np, nmax, dormant, 1), DBG_K("k_restored"));
                             CK(cudaMemcpy(c.npend, c.npend + 1, 4, cudaMemcpyDeviceToDevice));
                             pend_left = VERIF_FRAMES;
                         } else {   // meme cle d'etat -> instantane valide par construction : pas de verification
-                            (k_restored<<<G, B>>>(c, S.Np, M.nmax, dormant, 0), DBG_K("k_restored"));
+                            (k_restored<<<G, B>>>(c, S.Np, nmax, dormant, 0), DBG_K("k_restored"));
                             CK(cudaMemset(c.npend, 0, 8));
                             pend_left = 0;
                         }
@@ -1119,10 +1281,13 @@ static void run_taa_mode(Scene& S, const char* scen_file, int nseeds) {
     }
 }
 
+#include "prep_mesh.cuh"
+
 int main(int argc, char** argv) {
     if (argc < 3) { fprintf(stderr, "usage\n"); return 1; }
     std::string mode = argv[1];
     if (const char* d = getenv("BENCH_DEBUG")) g_debug = atoi(d);
+    if (const char* r = getenv("BENCH_RAYONS")) g_rays = std::max(0.25f, (float)atof(r));
     if (g_debug) {
         int drv = 0, rt = 0, dev = 0; cudaDriverGetVersion(&drv); cudaRuntimeGetVersion(&rt); cudaGetDevice(&dev);
         cudaDeviceProp pr; cudaGetDeviceProperties(&pr, dev);
@@ -1136,6 +1301,10 @@ int main(int argc, char** argv) {
             pr.name, pr.major, pr.minor, pr.multiProcessorCount, pr.totalGlobalMem / 1048576.0, drv, rt, NV, NL);
     }
     NvtxScope nvtx_main(argv[1]);
+    if (mode == "prep") {   // poc_gpu prep <maillage.mesh> <scene.bin> [points] : scene maillee -> scene du bench
+        if (argc < 4) { fprintf(stderr, "usage : prep <maillage.mesh> <scene.bin> [nombre de points]\n"); return 1; }
+        return prep_mode(argv[2], argv[3], argc > 4 ? atoi(argv[4]) : 300000);
+    }
     if (mode == "res") CK(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));   // attente passive : CPU = vrai travail hote
     CK(cudaFree(0));
     double v0 = vram_used_mb(), r0 = ram_mb();
@@ -1144,7 +1313,11 @@ int main(int argc, char** argv) {
     Runner R(S);
     double v2 = vram_used_mb();
     cudaDeviceProp prop; cudaGetDeviceProperties(&prop, 0);
-    printf("{\"type\":\"scene\",\"np\":%d,\"nt\":%d,\"gpu\":\"%s\",\"mask_bits\":%d}\n", S.Np, S.Nt, prop.name, NV);
+    if (g_rays == 1.f)
+        printf("{\"type\":\"scene\",\"np\":%d,\"nt\":%d,\"gpu\":\"%s\",\"mask_bits\":%d}\n", S.Np, S.Nt, prop.name, NV);
+    else
+        printf("{\"type\":\"scene\",\"np\":%d,\"nt\":%d,\"gpu\":\"%s\",\"mask_bits\":%d,\"rayons_par_point\":%.2f,\"triangles_statiques\":%d}\n",
+               S.Np, S.Nt, prop.name, NV, g_rays, S.nst);
     if (mode == "res") {
         printf("{\"type\":\"vram\",\"contexte_mb\":%.1f,\"scene_mb\":%.1f,\"cache_tous_buffers_mb\":%.1f,\"ram_pic_mb\":%.1f,\"ram_debut_mb\":%.1f}\n",
                v0, v1 - v0, v2 - v1, ram_mb(), r0);
@@ -1193,6 +1366,7 @@ int main(int argc, char** argv) {
             fflush(stdout);
         }
     } else if (mode == "taa") {
+        if (S.fmt == 3) { fprintf(stderr, "mode taa non supporte sur les scenes maillees\n"); return 1; }
         run_taa_mode(S, argv[4], atoi(argv[3]));
     } else if (mode == "scenf") {
         int nseeds = atoi(argv[3]);
@@ -1221,15 +1395,21 @@ int main(int argc, char** argv) {
         fclose(sf);
         int dyn = 0;   // lampes dont l'intensite change entre etats -> "responsive" pour SHaRC
         for (int s2 = 1; s2 < S.NS; ++s2) for (int l = 0; l < NL; ++l) if (S.inten[s2][l] != S.inten[0][l]) dyn |= 1 << l;
+        // budget des baselines a temps GPU egal : 1,57x (SHaRC) / 1,53x (accumulation) calibres sur RTX 4060 pour les scenes
+        // en boites ; argument optionnel = budget mesure sur CETTE scene (scenes maillees : cout du BVH different)
+        float bS = 1.57f, bA = 1.53f;
+        if (argc > 5) bS = bA = (float)atof(argv[5]);
+        char nm[128];
+        auto nmf = [&](const char* fmt, float b) { snprintf(nm, sizeof nm, fmt, b); return std::string(nm); };
         std::vector<Method> M;
-        { Method r{"SHaRC N=64 resp=8, 1.57x", 0, 64.f, 1.57f, false, false, false}; r.resp_mask = dyn; r.nmax_resp = 8.f; r.rescale = true; M.push_back(r); }
-        { Method r{"SHaRC + memoire naive, 1.57x", 0, 64.f, 1.57f, false, false, false}; r.resp_mask = dyn; r.nmax_resp = 8.f; r.rescale = true; r.memory = true; M.push_back(r); }
-        { Method r{"Accumulation+parlampe N=32, 1.53x", 0, 32.f, 1.53f, false, false, false}; r.rescale = true; M.push_back(r); }
-        { Method r{"Accum+parlampe + memoire naive N=32, 1.53x", 0, 32.f, 1.53f, false, false, false}; r.rescale = true; r.memory = true; M.push_back(r); }
-        { Method r{"Accum+parlampe + memoire naive N=64, 1.53x", 0, 64.f, 1.53f, false, false, false}; r.rescale = true; r.memory = true; M.push_back(r); }
-        { Method r{"SHaRC + memoire + instantanes, 1.57x", 0, 64.f, 1.57f, false, false, false}; r.resp_mask = dyn; r.nmax_resp = 8.f; r.rescale = true; r.memory = true; r.snaps = true; M.push_back(r); }
-        { Method r{"Accum + memoire + instantanes N=32, 1.53x", 0, 32.f, 1.53f, false, false, false}; r.rescale = true; r.memory = true; r.snaps = true; M.push_back(r); }
-        { Method r{"Accum + memoire + instantanes N=64, 1.53x", 0, 64.f, 1.53f, false, false, false}; r.rescale = true; r.memory = true; r.snaps = true; M.push_back(r); }
+        { Method r{nmf("SHaRC N=64 resp=8, %.2fx", bS), 0, 64.f, bS, false, false, false}; r.resp_mask = dyn; r.nmax_resp = 8.f; r.rescale = true; M.push_back(r); }
+        { Method r{nmf("SHaRC + memoire naive, %.2fx", bS), 0, 64.f, bS, false, false, false}; r.resp_mask = dyn; r.nmax_resp = 8.f; r.rescale = true; r.memory = true; M.push_back(r); }
+        { Method r{nmf("Accumulation+parlampe N=32, %.2fx", bA), 0, 32.f, bA, false, false, false}; r.rescale = true; M.push_back(r); }
+        { Method r{nmf("Accum+parlampe + memoire naive N=32, %.2fx", bA), 0, 32.f, bA, false, false, false}; r.rescale = true; r.memory = true; M.push_back(r); }
+        { Method r{nmf("Accum+parlampe + memoire naive N=64, %.2fx", bA), 0, 64.f, bA, false, false, false}; r.rescale = true; r.memory = true; M.push_back(r); }
+        { Method r{nmf("SHaRC + memoire + instantanes, %.2fx", bS), 0, 64.f, bS, false, false, false}; r.resp_mask = dyn; r.nmax_resp = 8.f; r.rescale = true; r.memory = true; r.snaps = true; M.push_back(r); }
+        { Method r{nmf("Accum + memoire + instantanes N=32, %.2fx", bA), 0, 32.f, bA, false, false, false}; r.rescale = true; r.memory = true; r.snaps = true; M.push_back(r); }
+        { Method r{nmf("Accum + memoire + instantanes N=64, %.2fx", bA), 0, 64.f, bA, false, false, false}; r.rescale = true; r.memory = true; r.snaps = true; M.push_back(r); }
         M.push_back({"Oracle", 1, 64.f, 1.f, false, false, true});
         M.push_back({"v3", 1, 64.f, 1.f, true, true, false, 4});
         { Method r{"v4-A2C memoire verifiee+rampe", 1, 64.f, 1.f, true, true, false, 4}; r.memory = true; r.wake_verify = true; r.ramp = true; M.push_back(r); }

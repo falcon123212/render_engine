@@ -137,7 +137,7 @@ Sous Windows, dans une invite de commandes classique : `cuda\build_windows.bat`.
 
 **Déjà lancé une fois ?** `git pull`, puis `./cuda/run_cuda.sh --echelle` : seulement les nouvelles mesures de temps et de ressources à 530 k et 1 M points. Détails dans [LINUX.md](LINUX.md#mise-à-jour-du-9-octobre-2026--update-2026-10-09).
 
-**Scènes publiques** (Sponza, Bistro… du dépôt officiel NVIDIA RTXGI-Assets) : `./scenes_publiques/telecharger.sh` (ajouter `--bistro` pour Bistro, +2,3 Go). Le bench ne les lit pas encore : c'est la préparation d'une prochaine version.
+**Scènes publiques** (Sponza, Bistro… du dépôt officiel NVIDIA RTXGI-Assets) : `./scenes_publiques/telecharger.sh` (ajouter `--bistro` pour Bistro, +2,3 Go), puis `./cuda/run_cuda.sh --publiques-test` (~5 min) et `./cuda/run_cuda.sh --publiques` (~30 à 60 min). Il faut numpy (`sudo apt install python3-numpy`). Détails dans [LINUX.md](LINUX.md#c-le-bench-sur-les-scènes-publiques-5-min-de-test-puis-30-à-60-min).
 
 ### Ce qui est mesuré
 
@@ -175,7 +175,7 @@ This repo benchmarks "ghost lighting" in NVIDIA's radiance caches (SHaRC and NRC
   - Prerequisites: VS 2022 with C++ and the Windows SDK, CMake ≥ 3.24, Git for Windows + Git LFS, Vulkan SDK, Python + numpy, a recent NVIDIA driver (≥ 572 for RTX 50), ~30 GB free disk. Do not use the PC or minimise the render window during the runs.
 - **Bench B (Linux and Windows, CUDA)**: see **[LINUX.md](LINUX.md)**. `./cuda/build.sh` (CUDA ≥ 12.8), `./cuda/run_cuda.sh --test`, `--debug` (NVTX / kernel-checked traces), then `./cuda/run_cuda.sh` and `./cuda/run_cuda.sh --pack`.
   - Already ran it? `git pull`, then `./cuda/run_cuda.sh --echelle` (new 530 k / 1 M point timing only) and `--pack`.
-  - Public scenes (Sponza, Bistro… from NVIDIA's RTXGI-Assets): `./scenes_publiques/telecharger.sh [--bistro]`. Not read by the bench yet.
+  - Public scenes (Sponza, Bistro… from NVIDIA's RTXGI-Assets): `./scenes_publiques/telecharger.sh [--bistro]`, then `./cuda/run_cuda.sh --publiques-test` and `--publiques` (needs numpy).
 - Reference results for an RTX 4060 are in `reference/`.
 
 ## Licences

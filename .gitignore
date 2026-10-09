@@ -11,3 +11,4 @@ __pycache__/
 cuda/scenes/scene_scale_530k.bin
 cuda/scenes/scene_scale_1M.bin
 scenes_publiques/RTXGI-Assets/
+scenes_publiques/cache/

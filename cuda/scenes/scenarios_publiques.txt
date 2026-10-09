@@ -1,0 +1,11 @@
+# Scenarios des scenes publiques (maillages). Etats crees par "poc_gpu_l3 prep" :
+#   0 : lampes 1 et 2 allumees, cube en A      1 : lampe 1 eteinte, cube en A
+#   2 : lampes 1 et 2 allumees, cube en B      3 : lampes 1, 2 et 3 allumees (3 : premiere fois), cube en A
+#   4 : lampe 1 eteinte, cube en B
+# nom;etat:images,etat:images,...  (erreur mesuree sur les 30 images apres le DERNIER evenement)
+R1 lampe allumee-eteinte-rallumee;0:50,1:30,0:50
+R2 lampe eteinte, cube deplace dans le noir, rallumee;0:40,1:20,4:20,2:50
+R3 cube deplace puis remis;0:50,2:30,0:50
+I1 lampe eteinte;0:50,1:50
+I2 cube deplace;0:50,2:50
+I3 lampe allumee 1re fois;0:50,3:50

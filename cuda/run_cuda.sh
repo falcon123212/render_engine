@@ -6,6 +6,9 @@
 #   ./cuda/run_cuda.sh --test      verification rapide / quick check    (~1 min)
 #   ./cuda/run_cuda.sh --debug     traces de debogage / debug traces    (~5 min)
 #   ./cuda/run_cuda.sh --echelle   seulement temps + ressources a 530 k et 1 M points / only scale runs (~5-10 min)
+#   ./cuda/run_cuda.sh --publiques       scenes publiques NVIDIA (Sponza, Bistro...) / public scenes   (~30-60 min)
+#   ./cuda/run_cuda.sh --publiques-test  idem, 1 graine, CornellBox + Sponza seulement / quick check   (~5 min)
+#     (scenes a telecharger avant : ./scenes_publiques/telecharger.sh [--bistro] ; python3 + numpy requis)
 #   ./cuda/run_cuda.sh --pack      archive des resultats a renvoyer / results archive to send back
 #
 # Mode --debug (voir LINUX.md) :
@@ -17,7 +20,7 @@ cd "$(dirname "$0")"
 PY=$(command -v python3 || command -v python || true)
 [ -n "$PY" ] || { echo "ERREUR : python3 introuvable / python3 not found"; exit 1; }
 MODE=full
-case "$1" in --test) MODE=test;; --debug) MODE=debug;; --pack) MODE=pack;; --echelle) MODE=echelle;; "") ;; *) echo "argument inconnu / unknown argument: $1"; exit 1;; esac
+case "$1" in --test) MODE=test;; --debug) MODE=debug;; --pack) MODE=pack;; --echelle) MODE=echelle;; --publiques) MODE=pub;; --publiques-test) MODE=pubtest;; "") ;; *) echo "argument inconnu / unknown argument: $1"; exit 1;; esac
 step () { echo "$(date '+%H:%M:%S') $*"; }
 
 if [ $MODE = pack ]; then
@@ -31,12 +34,12 @@ if [ $MODE = pack ]; then
 fi
 
 EXT=""; case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) EXT=".exe";; esac
-if [ ! -f "poc_gpu_l3$EXT" ] || [ ! -f "poc_gpu_l8$EXT" ]; then
-  step "compilation / build"
+if [ ! -f "poc_gpu_l3$EXT" ] || [ ! -f "poc_gpu_l8$EXT" ] || [ poc_gpu.cu -nt "poc_gpu_l3$EXT" ] || [ prep_mesh.cuh -nt "poc_gpu_l3$EXT" ]; then
+  step "compilation / build (sources plus recentes que le binaire / sources newer than binary)"
   if [ -n "$EXT" ]; then cmd //c "$(cygpath -w "$PWD/build_windows.bat")"; else ./build.sh; fi
 fi
 
-case $MODE in full|echelle) OUT="../results/cuda"; SEEDS=10;; test) OUT="../results/cuda_test"; SEEDS=1;; debug) OUT="../results/cuda_debug"; SEEDS=1;; esac
+case $MODE in full|echelle|pub) OUT="../results/cuda"; SEEDS=10;; test|pubtest) OUT="../results/cuda_test"; SEEDS=1;; debug) OUT="../results/cuda_debug"; SEEDS=1;; esac
 mkdir -p "$OUT"
 { date '+%F %T'; nvidia-smi --query-gpu=name,driver_version,memory.total,compute_cap --format=csv 2>/dev/null || true
   nvcc --version 2>/dev/null | tail -2; uname -a; grep PRETTY_NAME /etc/os-release 2>/dev/null || true; } > "$OUT/systeme_cuda.txt"
@@ -82,7 +85,40 @@ if [ $MODE = debug ]; then
   exit 0
 fi
 
-if [ $MODE != echelle ]; then
+if [ $MODE = pub ] || [ $MODE = pubtest ]; then
+  # Scenes publiques : glTF -> maillage (convertir.py) -> scene du bench (prep : BVH, points de cache, lampes, cube,
+  # references ; mis en cache dans scenes_publiques/cache/) -> temps par image -> budget a temps egal -> scenarios.
+  "$PY" -c "import numpy" 2>/dev/null || { echo "ERREUR : numpy manquant -> sudo apt install python3-numpy (ou pip install numpy) / numpy missing"; exit 1; }
+  PUBD=../scenes_publiques; A=$PUBD/RTXGI-Assets; CACHE=$PUBD/cache; mkdir -p "$CACHE"
+  export BENCH_RAYONS=8
+  LISTE="cornellbox:CornellBox/cornell_box.gltf bathroom:Bathroom/LAZIENKA.gltf livingroom:LivingRoom/living_room.gltf sponza:Sponza/glTF/Sponza.gltf bistro:Bistro/bistro.gltf"
+  [ $MODE = pubtest ] && LISTE="cornellbox:CornellBox/cornell_box.gltf sponza:Sponza/glTF/Sponza.gltf"
+  n_ok=0
+  for spec in $LISTE; do
+    n=${spec%%:*}; g=$A/${spec#*:}
+    if [ ! -f "$g" ]; then step "$n : scene absente, sautee (./scenes_publiques/telecharger.sh) / scene missing, skipped"; continue; fi
+    if [ ! -s "$CACHE/$n.mesh" ]; then
+      step "$n : conversion glTF -> maillage / converting"
+      "$PY" ../scenes_publiques/convertir.py "$g" "$CACHE/$n.mesh.tmp" > "$CACHE/$n.maillage.json" && mv "$CACHE/$n.mesh.tmp" "$CACHE/$n.mesh"
+    fi
+    if [ ! -s "$CACHE/$n.bin" ]; then
+      step "$n : preparation (BVH, points de cache, references ; 1 a 10 min) / preparing"
+      ./poc_gpu_l3$EXT prep "$CACHE/$n.mesh" "$CACHE/$n.bin.tmp" > "$CACHE/$n.prep.jsonl" 2> "$CACHE/$n.prep.log" \
+        || { tail -5 "$CACHE/$n.prep.log"; step "ECHEC preparation $n : voir $CACHE/$n.prep.log"; continue; }
+      mv "$CACHE/$n.bin.tmp" "$CACHE/$n.bin"
+    fi
+    cp "$CACHE/$n.prep.jsonl" "$OUT/prep_$n.jsonl" 2>/dev/null || true; cp "$CACHE/$n.prep.log" "$OUT/prep_$n.log" 2>/dev/null || true
+    cp "$CACHE/$n.maillage.json" "$OUT/maillage_$n.json" 2>/dev/null || true
+    R timing_pub_$n.jsonl ./poc_gpu_l3$EXT timing "$CACHE/$n.bin"
+    B=$("$PY" budget.py "$OUT/timing_pub_$n.jsonl")
+    step "$n : budget des baselines a temps egal / equal-time baseline budget = ${B}x"
+    R scen_pub_$n.jsonl ./poc_gpu_l3$EXT scenf "$CACHE/$n.bin" $SEEDS scenes/scenarios_publiques.txt $B
+    n_ok=$((n_ok + 1))
+  done
+  unset BENCH_RAYONS
+  [ $n_ok -gt 0 ] || { echo "ERREUR : aucune scene publique trouvee -> ./scenes_publiques/telecharger.sh / no public scene found"; exit 1; }
+fi
+if [ $MODE = full ] || [ $MODE = test ]; then
 R res_170k.jsonl     ./poc_gpu_l3$EXT res scenes/scene_scale_170k.bin
 R timing_43k.jsonl   ./poc_gpu_l3$EXT timing scenes/scene_scale_43k.bin
 R timing_170k.jsonl  ./poc_gpu_l3$EXT timing scenes/scene_scale_170k.bin
@@ -100,5 +136,5 @@ if [ $MODE = full ] || [ $MODE = echelle ]; then   # grandes scenes (taille reel
 fi
 PYTHONIOENCODING=utf-8 "$PY" analyse_cuda.py "$OUT" > "$OUT/RESULTATS_CUDA.md"
 step "fini / done : $OUT/RESULTATS_CUDA.md"
-[ $MODE != test ] && step "Pour renvoyer les resultats / to send results back : ./cuda/run_cuda.sh --pack"
+[ $MODE != test ] && [ $MODE != pubtest ] && step "Pour renvoyer les resultats / to send results back : ./cuda/run_cuda.sh --pack"
 exit 0

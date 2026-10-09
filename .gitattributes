@@ -4,3 +4,7 @@
 *.patch -text
 *.bin binary
 *.jpg binary
+*.cu text eol=lf
+*.cuh text eol=lf
+*.txt text eol=lf
+*.md text eol=lf
